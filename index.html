@@ -1,0 +1,3670 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0, user-scalable=no" name="viewport"/>
+<title>TeleScope - Instant Telegram Discovery</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+/*
+Вечерняя заметка к этому коду — не инструкция, а рассказ тихим голосом.
+Здесь я объясняю, что живёт в этой части скрипта и почему: какие переменные хранят состояние, какие функции
+меняют сцены и на что стоит обращать внимание, когда что-то идёт не так.
+
+Коротко о главных сущностях (чтобы не теряться):
+- globalCometTimer: ссылка на интервал, который тихо меняет направление потока комет раз в 150 секунд.
+  Если null — цикл ещё не запущен. Это сердечный метр сцены: его можно остановить, но тогда рутина перестанет меняться.
+- globalCometStartTime: момент (ms), когда мы начали отсчёт. Помогает синхронизировать фазы при повторном показе сцены.
+- currentMode: 'search' или 'regdate' — явное состояние интерфейса. От него зависят видимость блоков и запуск эффектов.
+- cometDirection: 'right' или 'left' — в какую сторону сейчас летят звёздные хвосты. Рандом при старте для разнообразия.
+- cometInterval: ID интервала, который каждую ~225ms создаёт новую комету (или undefined, если поток остановлен).
+- isTransitioning: булев флаг, который защищает интерфейс от параллельных переключений и гонок классов в DOM.
+- activeComets: массив объектов {left, top, element} — текущее положение видимых комет, нужен для проверки коллизий.
+
+Про функции в духе «что они делают и зачем» (коротко, по-настоящему):
+- createTransitionStars()
+  создаёт временную стаю звёзд и потоки ветра — только на время переключения вкладок.
+  Порождает DOM-элементы с рандомными задержками, чтобы эффект выглядел живым.
+  Важно: не держать это всё постоянно, иначе устройство устанет.
+
+- switchToSearch()
+  переводит сцену в режим поиска. Сначала блокируем управление, запускаем мягкие эффекты, затем
+  меняем классы у body и контента в несколько шагов (быстрая фаза скрытия — затем медленное появление).
+  Побочный эффект: останавливает генерацию комет, но не трогает глобальный таймер.
+
+- switchToRegdate()
+  зеркально противоположная функция: выводит карточку с оценкой даты регистрации,
+  включает фоновые звёзды и при необходимости стартует глобальный таймер комет.
+  Здесь мы синхронизируем состояние по времени, чтобы не «прыгать» фазами при каждом открытии.
+
+- createComet(direction)
+  подбирает стартовую позицию (пытается до 10 раз, чтобы не рождать кометы впритык),
+  создаёт DOM-элемент с хвостом и случайной длительностью анимации (8–14s),
+  добавляет в activeComets и удаляет по завершении анимации.
+  На практике: уменьшите частоту или duration, если наблюдаются лаги на мобильных.
+
+- startGlobalCometTimer()
+  запускает долгий цикл, который каждые 150 секунд переводит направление и даёт сцене жизнь.
+  Idempotent: если таймер уже есть, функция ничего не делает.
+
+- startCometShower()
+  немедленно создаёт одну комету, затем запускает интервал (каждые ~225ms) для плотного потока.
+  Хорош для «зрелищ», но опасен для слабых устройств — контролируйте плотность.
+
+- stopComets()
+  очищает cometInterval — поток заканчивается. Не трогает глобальный таймер, чтобы сцена могла возобновиться в том же ритме.
+
+- createParticles() / createStars()
+  нежные фоновые эффекты для режима поиска и regdate соответственно.
+  Они дают глубину, но ничего не делают с логикой — при проблемах с производительностью их число можно резать.
+
+- createMatrixField(element, format)
+  визуальная имитация «загрузки данных» — генератор случайных цифр/дат для эффекта.
+  Если вы хотите реальные значения, замените генерацию на реальные данные из API.
+
+Небольшие рекомендации, как обращаться с этим кодом:
+- Периодичности и длительности (150000ms, 225ms, 8000..14000ms) — это то, с чем можно играть.
+  Уменьшайте частоту появления комет и длину анимаций на мобильных.
+- Проверяйте isTransitioning перед изменением глобальных классов, чтобы не допустить гонки.
+- Если вкладка свёрнута, таймеры могут «подтупливать» — синхронизируйте по Date.now(), как здесь.
+- activeComets требует аккуратной синхронизации: удаляйте записи, когда элемент удалён, иначе масcив растёт.
+- performance tip: heavy blur/box-shadow наносит ущерб батарее; применяйте к ::before и ограничивайте область.
+
+Если хочешь, могу переписать описания функций прямо перед каждой их реализацией в коде — так, чтобы комментарий стоял ровно над телом функции
+и читалcя как личная заметка программиста (без заголовков и рамок). Или могу сократить/удлинить стиль: повеселее — оставлю чуть мистики, серьёзнее — сделаю сухо и технически.
+*/
+/*
+================================================================================
+ДЕБАГ / ЧАСТЫЕ ПРОБЛЕМЫ:
+- Если кометы не появляются: проверьте, что starsContainer присутствует и имеет видимые размеры.
+- Если переключение режимоv 'залипает': проверьте флаг isTransitioning и не создавайте
+  параллельных setTimeout'ов, изменяющих те же классы.
+- Если производительность падает на мобилках: уменьшите числа в createStars/createParticles,
+  увеличьте интервал в startCometShower или уменьшите animationDuration для комет.
+================================================================================
+*/
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+        
+        /* базовый сброс. Я всегда пишу это как магическую чистку —
+   убираем отступы и готовим холст, чтобы визуальные эффекты не дрались с браузером. */
+* {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        /* отключаю caret для всех, кроме полей ввода —
+   чувствую себя капризным мудрецом, запрещаю курсору светиться там, где он мешает. */
+*:not(.search-input, .reg-input) {
+            caret-color: transparent !important;
+        }
+
+        .search-input, .reg-input {
+            caret-color: auto !important;
+        }
+
+        /* аватарки и иконки — их нельзя выделять мышью.
+   Это предотвращает дергание при тачах и придаёт интерфейсу аккуратность. */
+.user-avatar, .profile-avatar, .logo-icon {
+            user-select: none !important;
+            -webkit-user-select: none !important;
+            -moz-user-select: none !important;
+            -ms-user-select: none !important;
+        }
+
+        /* крестик закрытия тоже не должен выделяться.
+   Маленькая деталь, но она делает модалки более надёжными на тачах. */
+.close-button {
+            user-select: none !important;
+            -webkit-user-select: none !important;
+            -moz-user-select: none !important;
+            -ms-user-select: none !important;
+        }
+
+        /* тело страницы — это сцена. padding и overflow управляют рамкой,
+   а fallback background защищает от мерцания белого экрана при загрузке. */
+body {
+            min-height: 100vh;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            overflow: hidden;
+            padding: 20px;
+            background: #1e3c72; 
+        }
+
+        
+        /* контейнер космического фона. Расширяем за пределы экрана,
+   чтобы при трансформациях не было пустот — словно небо шире, чем окно. */
+.cosmic-background {
+            position: fixed;
+            top: -20%;
+            left: -20%;
+            width: 140%;
+            height: 140%;
+            z-index: -1;
+            overflow: hidden;
+        }
+
+        
+        /* градиент-основа, она сглаживает переходы и скрывает швы.
+   opacity здесь — как дымка, влияет на читаемость текста. */
+.cosmic-background::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(135deg, 
+                #1e3c72 0%, 
+                #2a5298 20%, 
+                #1c3d8f 40%, 
+                #2563eb 60%, 
+                #4c1d95 80%, 
+                #7e22ce 100%);
+            z-index: -2;
+            opacity: 0.8;
+        }
+
+        /* слой фона — все движения управляются здесь (transform/opacity).
+   will-change помогает браузеру заранее подготовить ускорение — экономим fps. */
+.bg-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            transition: all 3.2s cubic-bezier(0.16, 1, 0.3, 1);
+            will-change: transform, opacity;
+        }
+
+        /* этот слой отвечает за вид 'поиска' — яркие радиалы и мягкие пятна.
+   Я держу opacity=1 по умолчанию и смещаю/скэлю для переходов. */
+.search-bg {
+            background: 
+                radial-gradient(ellipse at 20% 20%, rgba(139, 92, 246, 0.9) 0%, transparent 55%),
+                radial-gradient(ellipse at 80% 80%, rgba(59, 130, 246, 0.7) 0%, transparent 55%),
+                radial-gradient(ellipse at 50% 50%, rgba(99, 102, 241, 0.3) 0%, transparent 70%),
+                linear-gradient(135deg, #1e3c72 0%, #2a5298 25%, #4c1d95 50%, #6366f1 75%, #7e22ce 100%);
+            opacity: 1;
+            transform: translateY(0) scale(1) rotate(0deg);
+            filter: blur(0px);
+        }
+
+        /* regdate-bg — более сдержанная палитра, появляется сверху.
+   transform и blur сделаны так, чтобы он входил плавно, не роняя читабельность. */
+.regdate-bg {
+            background: 	
+                radial-gradient(ellipse at 30% 30%, rgba(30, 64, 175, 1) 0%, transparent 45%),
+                radial-gradient(ellipse at 70% 70%, rgba(30, 58, 138, 0.8) 0%, transparent 55%),
+                radial-gradient(ellipse at 50% 10%, rgba(59, 130, 246, 0.5) 0%, transparent 65%),
+                radial-gradient(ellipse at 20% 80%, rgba(37, 99, 235, 0.4) 0%, transparent 60%),
+                linear-gradient(135deg, #0c1220 0%, #1a3570 15%, #1c3d8f 35%, #2563eb 55%, #3b82f6 70%, #1a3570 85%, #0c1220 100%);
+            opacity: 0;
+            transform: translateY(-130vh) scale(1.4) rotate(-4deg);
+            filter: blur(0px);
+        }
+
+        /* дополнительная ::before копия — для размытия (performance trick).
+   Применяя blur к ::before, мы ограничиваем область тяжёлого рендеринга. */
+.bg-layer::before {
+            content: '';
+            position: absolute;
+            top: -100px;
+            left: -100px;
+            right: -100px;
+            bottom: -100px;
+            background: inherit;
+            z-index: -1;
+            filter: blur(70px);
+            opacity: 0.9;
+        }
+
+        
+        /* при переходе в regdate этот search-bg уходит вниз и мутнеет.
+   Это даёт ощущение спуска к более «глубокой» информации. */
+body.transitioning-to-regdate .search-bg {
+            opacity: 0;
+            transform: translateY(130vh) scale(0.6) rotate(4deg);
+            filter: blur(25px);
+        }
+
+        /* regdate-bg появляется — как раскрывающийся том старых записей.
+   Используем blur=0 и opacity=1, чтобы пользователь понял: информация появилась. */
+body.transitioning-to-regdate .regdate-bg {
+            opacity: 1;
+            transform: translateY(0) scale(1) rotate(0deg);
+            filter: blur(0px);
+        }
+
+        body.transitioning-to-search .search-bg {
+            opacity: 1;
+            transform: translateY(0) scale(1) rotate(0deg);
+            filter: blur(0px);
+        }
+
+        body.transitioning-to-search .regdate-bg {
+            opacity: 0;
+            transform: translateY(-130vh) scale(1.4) rotate(-4deg);
+            filter: blur(25px);
+        }
+
+        body.transitioning-to-regdate::after,
+        body.transitioning-to-search::after {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: radial-gradient(ellipse at center, 
+                rgba(59, 130, 246, 0.3) 0%, 
+                rgba(30, 58, 138, 0.4) 50%, 
+                rgba(126, 34, 206, 0.3) 100%);
+            z-index: -5;
+            opacity: 1;
+            transition: opacity 1.5s ease;
+        }
+
+        
+        body::before {
+            content: '';
+            position: fixed;
+            top: -100px;
+            left: -100px;
+            right: -100px;
+            bottom: -100px;
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 50%, #7e22ce 100%);
+            z-index: -10;
+        }
+
+        
+        /* контейнер временных звёзд — он появляется только на миг,
+   чтобы не грузить рендер постоянно. Здесь живёт магия переходов. */
+.transition-stars {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            top: 0;
+            left: 0;
+            pointer-events: none;
+            z-index: 15;
+            opacity: 0;
+            transition: opacity 1s ease;
+        }
+
+        .transition-stars.active {
+            opacity: 1;
+        }
+
+        /* мелкие элементы, которые вспыхивают и гаснут.
+   Случайные задержки делают анимацию «живой», как мерцание свечи. */
+.transition-star {
+            position: absolute;
+            background: white;
+            border-radius: 50%;
+            animation: cosmicTransit 2.8s ease-out forwards;
+        }
+
+        
+        /* тонкие вертикальные полосы — создают ощущение движения воздуха.
+   Их высота и delay рандомизированы — это делает сцену динамичной. */
+.cosmic-wind {
+            position: absolute;
+            width: 3px;
+            height: 100px;
+            background: linear-gradient(to bottom, 
+                transparent 0%, 
+                rgba(255, 255, 255, 0.9) 15%, 
+                rgba(135, 206, 235, 1) 50%, 
+                rgba(255, 255, 255, 0.9) 85%, 
+                transparent 100%);
+            border-radius: 3px;
+            opacity: 0;
+        }
+
+        /* Если я пишу 'up' — ветер поднимается. Это просто стейт для ключевого кадра. */
+.cosmic-wind.up {
+            animation: windUp 2.8s ease-out forwards;
+        }
+
+        /* 'down' — противоположно; используется для обратного перехода. */
+.cosmic-wind.down {
+            animation: windDown 2.8s ease-out forwards;
+        }
+
+        @keyframes cosmicTransit {
+            0% {
+                opacity: 0;
+                transform: scale(0) translateY(0) rotate(0deg);
+                box-shadow: 0 0 0 rgba(255, 255, 255, 0);
+            }
+            25% {
+                opacity: 0.8;
+                transform: scale(1.2) translateY(-40px) rotate(180deg);
+                box-shadow: 0 0 15px rgba(255, 255, 255, 0.6);
+            }
+            50% {
+                opacity: 1;
+                transform: scale(2) translateY(-80px) rotate(360deg);
+                box-shadow: 0 0 25px rgba(135, 206, 235, 0.9);
+            }
+            75% {
+                opacity: 0.7;
+                transform: scale(1.5) translateY(-120px) rotate(540deg);
+                box-shadow: 0 0 20px rgba(255, 255, 255, 0.4);
+            }
+            100% {
+                opacity: 0;
+                transform: scale(0) translateY(-160px) rotate(720deg);
+                box-shadow: 0 0 0 rgba(255, 255, 255, 0);
+            }
+        }
+
+        @keyframes windUp {
+            0% {
+                opacity: 0;
+                transform: translateY(150vh) scaleY(0.3) rotateZ(5deg);
+                filter: blur(3px);
+            }
+            20% {
+                opacity: 0.6;
+                transform: translateY(80vh) scaleY(1.2) rotateZ(2deg);
+                filter: blur(1px);
+            }
+            40% {
+                opacity: 0.9;
+                transform: translateY(20vh) scaleY(2.5) rotateZ(-1deg);
+                filter: blur(0px);
+            }
+            70% {
+                opacity: 1;
+                transform: translateY(-30vh) scaleY(3) rotateZ(-2deg);
+                filter: blur(0px);
+            }
+            100% {
+                opacity: 0;
+                transform: translateY(-180vh) scaleY(0.2) rotateZ(-5deg);
+                filter: blur(4px);
+            }
+        }
+
+        @keyframes windDown {
+            0% {
+                opacity: 0;
+                transform: translateY(-150vh) scaleY(0.3) rotateZ(-5deg);
+                filter: blur(3px);
+            }
+            20% {
+                opacity: 0.6;
+                transform: translateY(-80vh) scaleY(1.2) rotateZ(-2deg);
+                filter: blur(1px);
+            }
+            40% {
+                opacity: 0.9;
+                transform: translateY(-20vh) scaleY(2.5) rotateZ(1deg);
+                filter: blur(0px);
+            }
+            70% {
+                opacity: 1;
+                transform: translateY(30vh) scaleY(3) rotateZ(2deg);
+                filter: blur(0px);
+            }
+            100% {
+                opacity: 0;
+                transform: translateY(180vh) scaleY(0.2) rotateZ(5deg);
+                filter: blur(4px);
+            }
+        }
+
+        
+        /* wrapper — это сцена, внутри которой центруется всё содержимое.
+   Его transition управляет глобальным чувством плавности приложения. */
+.content-transition-wrapper {
+            position: relative;
+            z-index: 10;
+            width: 100%;
+            max-width: 800px;
+            transition: all 2.8s cubic-bezier(0.23, 1, 0.32, 1);
+        }
+
+        
+        /* он плавает сверху и служит хабом режимов.
+   Я делаю его шумоподавляющим: backdrop-filter и полупрозрачный фон. */
+.tab-switcher {
+            position: fixed;
+            top: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 50px;
+            padding: 6px;
+            display: flex;
+            z-index: 100;
+            width: 360px;
+            transition: box-shadow 0.6s ease;
+        }
+
+        body.tg-mobile .tab-switcher {
+            top: 90px;
+        }
+
+        .tab-switcher.transitioning {
+            box-shadow: 0 0 60px rgba(255, 255, 255, 0.5), 0 0 120px rgba(135, 206, 235, 0.4);
+        }
+
+        /* кнопки вкладок — простые, но с мягкой анимацией.
+   active-класс меняет визуал через tab-slider, а disabled — блокирует взаимодействие. */
+.tab-option {
+            flex: 1;
+            text-align: center;
+            padding: 12px 24px;
+            color: rgba(255, 255, 255, 0.7);
+            cursor: pointer;
+            border-radius: 44px;
+            font-weight: 500;
+            font-size: 14px;
+            transition: all 0.8s cubic-bezier(0.23, 1, 0.32, 1);
+            position: relative;
+            z-index: 2;
+            white-space: nowrap;
+        }
+
+        .tab-option.disabled {
+            pointer-events: none;
+            opacity: 0.5;
+        }
+
+        /* визуальный индикатор активной вкладки. Движение плавное — долгое время,
+   чтобы дать глазу место для отдыха и следить за сменой контекста. */
+.tab-slider {
+            position: absolute;
+            top: 6px;
+            left: 6px;
+            bottom: 6px;
+            width: calc(50% - 6px);
+            background: linear-gradient(135deg, #8b5cf6 0%, #3b82f6 100%);
+            border-radius: 44px;
+            transition: all 2.8s cubic-bezier(0.23, 1, 0.32, 1);
+            z-index: 1;
+            box-shadow: 0 0 20px rgba(139, 92, 246, 0.5);
+        }
+
+        .tab-slider.regdate {
+            transform: translateX(100%);
+            background: linear-gradient(135deg, #1e40af 0%, #1e3a8a 100%);
+            box-shadow: 0 0 20px rgba(30, 64, 175, 0.5);
+        }
+
+        .tab-option.active {
+            color: white;
+            font-weight: 600;
+        }
+
+        
+        /* тонкие точки по фону, добавляют глубину. Уменьшаем opacity,
+   чтобы они не отвлекали от основного контента, но дали ощущение пространства. */
+.bg-particles {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            top: 0;
+            left: 0;
+            pointer-events: none;
+            opacity: 0.3;
+            transition: all 2.8s cubic-bezier(0.23, 1, 0.32, 1);
+            z-index: 2;
+        }
+
+        .bg-particles.hidden {
+            opacity: 0;
+            transform: translateY(-140vh) scale(0.6);
+        }
+
+        .particle {
+            position: absolute;
+            width: 4px;
+            height: 4px;
+            background: white;
+            border-radius: 50%;
+            animation: float 15s infinite ease-in-out;
+        }
+
+        @keyframes float {
+            0%, 100% {
+                transform: translateY(0) translateX(0);
+                opacity: 0;
+            }
+            10% {
+                opacity: 0.8;
+            }
+            90% {
+                opacity: 0.8;
+            }
+            50% {
+                transform: translateY(-100px) translateX(50px);
+            }
+        }
+
+        
+        /* Блок звёзд/комет: управляем видимостью через .active, по умолчанию скрыт.
+   Все кометы добавляются в этот контейнер, чтобы легко очищать DOM. */
+.stars-container {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            top: 0;
+            left: 0;
+            pointer-events: none;
+            opacity: 0;
+            transition: all 2.8s cubic-bezier(0.23, 1, 0.32, 1);
+            z-index: 2;
+            transform: translateY(140vh) scale(1.4);
+        }
+
+        .stars-container.active {
+            opacity: 1;
+            transform: translateY(0) scale(1);
+        }
+
+        .particle {
+            position: absolute;
+            width: 4px;
+            height: 4px;
+            background: white;
+            border-radius: 50%;
+            animation: float 15s infinite ease-in-out;
+        }
+
+        @keyframes float {
+            0%, 100% {
+                transform: translateY(0) translateX(0);
+                opacity: 0;
+            }
+            10% {
+                opacity: 0.8;
+            }
+            90% {
+                opacity: 0.8;
+            }
+            50% {
+                transform: translateY(-100px) translateX(50px);
+            }
+        }
+
+        /* звезда — проста: twinkle animation, нужна для мелкого параллакса. */
+.star {
+            position: absolute;
+            background: white;
+            border-radius: 50%;
+            animation: twinkle 3s infinite ease-in-out;
+        }
+
+        @keyframes twinkle {
+            0%, 100% { opacity: 0.3; transform: scale(1); }
+            50% { opacity: 1; transform: scale(1.2); }
+        }
+
+        /* круглый элемент + длинный хвост (::after).
+   Через box-shadow и radial-gradient мы даём ощущение свечения — это дорого, но красиво. */
+.comet {
+            position: absolute;
+            width: 8px;
+            height: 8px;
+            background: radial-gradient(circle, #ffffff 0%, #87ceeb 70%, #4682b4 100%);
+            border-radius: 50%;
+            box-shadow: 0 0 15px 5px rgba(255, 255, 255, 0.9), 0 0 25px 8px rgba(135, 206, 235, 0.5);
+        }
+
+        .comet::after {
+            content: '';
+            position: absolute;
+            top: 50%;
+            transform: translateY(-50%);
+        }
+
+        /* направлен влево, с градиентом по длине. Это визуальный приём,
+   чтобы комета «уходила» в экран, а не резала глаз. */
+.comet.right::after {
+            right: 8px;
+            width: 120px;
+            height: 4px;
+            background: linear-gradient(to left, 
+                rgba(255,255,255,0.9) 0%, 
+                rgba(135, 206, 235, 0.8) 20%, 
+                rgba(70, 130, 180, 0.6) 40%, 
+                rgba(25, 25, 112, 0.4) 70%, 
+                transparent 100%);
+            border-radius: 4px;
+            box-shadow: 0 0 10px rgba(135, 206, 235, 0.6);
+        }
+
+        /* зеркало предыдущего. Важно, чтобы калькуляция позиций учитывала ширину окна. */
+.comet.left::after {
+            left: 8px;
+            width: 120px;
+            height: 4px;
+            background: linear-gradient(to right, 
+                rgba(255,255,255,0.9) 0%, 
+                rgba(135, 206, 235, 0.8) 20%, 
+                rgba(70, 130, 180, 0.6) 40%, 
+                rgba(25, 25, 112, 0.4) 70%, 
+                transparent 100%);
+            border-radius: 4px;
+            box-shadow: 0 0 10px rgba(135, 206, 235, 0.6);
+        }
+
+        /* Кадры для полёта кометы вправо/вниз: длительность задаётся в JS
+   и регулирует скорость исчезновения элемента из DOM. */
+@keyframes comet-right {
+            0% {
+                transform: translate(0, 0) rotate(45deg);
+                opacity: 0;
+            }
+            10% {
+                opacity: 1;
+            }
+            90% {
+                opacity: 1;
+            }
+            100% {
+                transform: translate(300vw, 300vh) rotate(45deg);
+                opacity: 0;
+            }
+        }
+
+        @keyframes comet-left {
+            0% {
+                transform: translate(0, 0) rotate(-45deg);
+                opacity: 0;
+            }
+            10% {
+                opacity: 1;
+            }
+            90% {
+                opacity: 1;
+            }
+            100% {
+                transform: translate(-300vw, 300vh) rotate(-45deg);
+                opacity: 0;
+            }
+        }
+
+        
+        .content-container {
+            position: relative;
+            z-index: 10;
+            width: 100%;
+            max-width: 800px;
+        }
+
+        
+        /* центральный, фокус на вводе. При скрытии мы используем
+   transform+opacity, чтобы не ломать layout измерениями. */
+.search-mode-content {
+            display: block;
+            text-align: center;
+            opacity: 1;
+            transform: translateY(0) scale(1);
+            transition: all 2.8s cubic-bezier(0.23, 1, 0.32, 1);
+        }
+
+        .search-mode-content.hidden {
+            opacity: 0;
+            transform: translateY(-100px) scale(0.85);
+            pointer-events: none;
+        }
+
+        
+        .search-mode-content.hidden /* крупный текст и иконка. glow animation добавляет жизни, но не мешает читабельности. */
+.logo {
+            transform: translateY(-30px) scale(0.9);
+            opacity: 0;
+            transition: all 0.5s ease;
+            transition-delay: 0s;
+        }
+
+        .search-mode-content:not(.hidden) .logo {
+            transform: translateY(0) scale(1);
+            opacity: 1;
+            transition: all 1.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+            transition-delay: 1.15s;
+        }
+
+        .search-mode-content.hidden .tagline {
+            transform: translateY(-20px);
+            opacity: 0;
+            transition: all 0.5s ease;
+            transition-delay: 0s;
+        }
+
+        .search-mode-content:not(.hidden) .tagline {
+            transform: translateY(0);
+            opacity: 1;
+            transition: all 1.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+            transition-delay: 1.15s;
+        }
+
+        .logo {
+            font-size: 48px;
+            font-weight: 900;
+            color: white;
+            margin-bottom: 8px;
+            letter-spacing: -2px;
+            text-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+            animation: glow 3s ease-in-out infinite;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+        }
+
+        .logo-icon {
+            width: 48px;
+            height: 48px;
+            background: linear-gradient(135deg, #fff 0%, rgba(255,255,255,0.8) 100%);
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+            transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1), height 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            transition-delay: 1.15s;
+        }
+
+        .search-mode-content.hidden .logo-icon {
+            transition-delay: 0s;
+            transition-duration: 0.5s;
+        }
+
+        @keyframes glow {
+            0%, 100% { 
+                text-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+                filter: brightness(1);
+            }
+            50% { 
+                text-shadow: 0 4px 20px rgba(255, 255, 255, 0.3);
+                filter: brightness(1.1);
+            }
+        }
+
+        .tagline {
+            color: rgba(255, 255, 255, 0.9);
+            font-size: 16px;
+            margin-bottom: 32px;
+            font-weight: 400;
+            user-select: text;
+            -webkit-user-select: text;
+            text-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+        }
+
+        /* стеклянная карточка с blur и shadow. При focus-within усиливаем shadow
+   чтобы дать feedback пользователю — это тонкая, но важная деталь UX. */
+.search-box {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(20px);
+            border-radius: 24px;
+            padding: 8px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+                        transform 1.2s cubic-bezier(0.34, 1.56, 0.64, 1),
+                        opacity 1.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+            position: relative;
+            overflow: visible;
+            max-width: 420px;
+            margin: 0 auto;
+            min-width: 223px;
+        }
+
+        .search-mode-content.hidden .search-box {
+            transform: translateY(-30px) scale(0.9);
+            opacity: 0;
+            transition-delay: 0s;
+            transition-duration: 0.5s;
+        }
+
+        .search-mode-content:not(.hidden) .search-box {
+            transform: translateY(0) scale(1);
+            opacity: 1;
+            transition-delay: 1.15s;
+        }
+
+        .search-box:focus-within {
+            background: white;
+            box-shadow: 0 24px 80px rgba(0, 0, 0, 0.4);
+            transform: translateY(-2px);
+        }
+
+        .avatar-wrapper {
+            width: 44px;
+            height: 44px;
+            position: relative;
+            flex-shrink: 0;
+            margin-left: 8px;
+        }
+
+        /* здесь определяем состояния (loading/error/deleted). Каждый класс — это визуальный маркер
+   для пользователя, важнее чем просто картинка. */
+.user-avatar {
+            width: 100%;
+            height: 100%;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #e0e7ff 0%, #c7d2fe 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            overflow: hidden;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+        }
+
+        .user-avatar.has-image {
+            animation: avatarPulse 0.4s ease;
+        }
+
+        @keyframes avatarPulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+            100% { transform: scale(1); }
+        }
+
+        .user-avatar.deleted {
+            background: linear-gradient(135deg, #94a3b8 0%, #64748b 100%);
+        }
+
+        .user-avatar.no-photo {
+            background: linear-gradient(135deg, #7dd3fc 0%, #2563eb 100%);
+        }
+
+        .user-avatar.error {
+            background: linear-gradient(135deg, #fca5a5 0%, #ef4444 100%);
+        }
+
+        .user-avatar.loading {
+            background: linear-gradient(135deg, #60a5fa 0%, #3b82f6 100%);
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+
+        .user-avatar img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .deleted-icon {
+            width: 24px;
+            height: 24px;
+            opacity: 0.6;
+        }
+
+        .error-icon {
+            color: white;
+            font-size: 24px;
+            font-weight: bold;
+        }
+
+        .loading-icon {
+            width: 24px;
+            height: 24px;
+            border: 2px solid rgba(255,255,255,0.3);
+            border-top: 2px solid white;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        /* caret-color сброшен в общем, но тут мы включаем его обратно.
+   Убедитесь, что placeholder остается контрастным для доступности. */
+.search-input {
+            background: none;
+            border: none;
+            outline: none;
+            font-size: 16px;
+            color: #1f2937;
+            flex: 1;
+            padding: 14px 0;
+            font-weight: 500;
+            transition: all 0.3s ease;
+            user-select: text;
+            -webkit-user-select: text;
+            min-width: 0;
+        }
+
+        .search-input::placeholder {
+            color: #94a3b8;
+            font-weight: 400;
+        }
+
+        /* Кнопка 'View Profile': градиент и тень делают её нажимаемой — анимация делает отклик.
+   :disabled стили важны для состояния, когда запрос идёт или нет доступа. */
+.search-button {
+            background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
+            border: none;
+            border-radius: 16px;
+            padding: 12px 24px;
+            color: white;
+            font-weight: 600;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1);
+            box-shadow: 0 4px 20px rgba(99, 102, 241, 0.4);
+            white-space: nowrap;
+            flex-shrink: 0;
+            margin-right: 4px;
+        }
+
+        .search-button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 25px rgba(99, 102, 241, 0.5);
+        }
+
+        .search-button:active {
+            transform: translateY(0);
+        }
+
+        .search-button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none !important;
+        }
+
+        
+        /* изолированная область с результатами, почти как лабораторный отчёт.
+   Изначально скрыта, появляется через .active с плавным подъёмом. */
+.regdate-mode-content {
+            visibility: hidden;
+            opacity: 0;
+            pointer-events: none;
+            transform: translateY(100px) scale(0.85);
+            transition: all 2.8s cubic-bezier(0.23, 1, 0.32, 1);
+            height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0;
+        }
+
+        .regdate-mode-content.active {
+            visibility: visible;
+            opacity: 1;
+            pointer-events: auto;
+            transform: translateY(0) scale(1);
+        }
+
+        /* card — стиль 'glass', padding и max-width контролируют плотность информации.
+   max-height и overflow: auto защищают модалку на маленьких экранах. */
+.regdate-card {
+            background: rgba(255, 255, 255, 0.9);
+            backdrop-filter: blur(20px);
+            border-radius: 24px;
+            padding: 32px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            position: relative;
+            width: 100%;
+            max-width: 800px;
+            margin: auto;
+            transform: translateY(50px) scale(0.9);
+            opacity: 0;
+            transition: all 1.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+        }
+
+        .regdate-mode-content.active .regdate-card {
+            transform: translateY(0) scale(1);
+            opacity: 1;
+            transition-delay: 1.15s
+        }
+
+        .regdate-mode-content:not(.active) .regdate-card {
+            transform: translateY(-50px) scale(0.85);
+            opacity: 0;
+            transition-delay: 0s;
+            transition-duration: 0.35s;
+        }
+
+        .regdate-header {
+            display: flex;
+            align-items: flex-start;
+            gap: 24px;
+            margin-bottom: 24px;
+        }
+
+        .regdate-left {
+            flex: 1;
+        }
+
+        .regdate-title {
+            font-size: 32px;
+            font-weight: 700;
+            color: #1f2937;
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .reg-input {
+            width: 100%;
+            padding: 14px 16px;
+            border: 2px solid #e5e7eb;
+            border-radius: 12px;
+            font-size: 16px;
+            font-weight: 500;
+            color: #1f2937;
+            background: white;
+            transition: all 0.3s ease;
+            font-family: 'Inter', sans-serif;
+        }
+
+        .reg-input:focus {
+            outline: none;
+            border-color: #3b82f6;
+            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+        }
+
+        .reg-input::placeholder {
+            color: #9ca3af;
+            font-weight: 400;
+        }
+
+        .get-id-btn {
+            background: linear-gradient(135deg, #1e40af 0%, #1e3a8a 100%);
+            border: none;
+            border-radius: 12px;
+            padding: 12px 20px;
+            color: white;
+            font-weight: 600;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 20px rgba(30, 64, 175, 0.4);
+            white-space: nowrap;
+        }
+
+        .get-id-btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 25px rgba(30, 64, 175, 0.5);
+        }
+
+        .regdate-right {
+            min-width: 200px;
+        }
+
+        /* коробка с метриками (ID, date, confidence). Тут важна чёткость шрифтов
+   и использование моноширинного для чисел — это читаемо и профессионально. */
+.result-item {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 12px;
+            padding: 16px;
+        }
+
+        .result-label {
+            font-size: 13px;
+            color: #6b7280;
+            font-weight: 500;
+            margin-bottom: 4px;
+        }
+
+        .result-value {
+            font-size: 18px;
+            font-weight: 700;
+            color: #1f2937;
+            font-family: 'SF Mono', 'Monaco', 'Inconsolata', monospace;
+        }
+
+        .result-subtitle {
+            font-size: 12px;
+            color: #9ca3af;
+            margin-top: 2px;
+        }
+
+        .regdate-results {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 24px;
+            margin-top: 24px;
+        }
+
+        .result-section {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .result-value .matrix-number {
+            font-family: 'SF Mono', 'Monaco', 'Inconsolata', monospace !important;
+            display: inline;
+        }
+        
+        .matrix-number {
+            display: inline;
+            font-family: 'SF Mono', 'Monaco', 'Inconsolata', monospace !important;
+        }
+
+        /* большой шрифт для % — визуальный приоритет. Это первое, что глядит пользователь. */
+.confidence-score {
+            font-size: 24px !important;
+        }
+
+        @keyframes matrix-flicker {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+
+        .flickering {
+            animation: matrix-flicker 0.1s ease-in-out;
+        }
+
+        
+        /* затемняющий слой и blur. Это не просто фон — он снимает контекст, переводя внимание в фокус. */
+.modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(20px);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.3s ease;
+            padding: 20px;
+        }
+
+        .modal-overlay.show {
+            opacity: 1;
+            pointer-events: auto;
+        }
+
+        /* профиль внутри модалки — компактно, кнопки внизу.
+   Тень и радиусы делают интерфейс мягким и узнаваемым. */
+.profile-modal {
+            background: white;
+            border-radius: 28px;
+            padding: 28px;
+            max-width: 400px;
+            width: 100%;
+            transform: translateY(20px) scale(0.9);
+            transition: all 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+            box-shadow: 0 30px 60px rgba(0, 0, 0, 0.3);
+            position: relative;
+        }
+
+        .modal-overlay.show .profile-modal {
+            transform: translateY(0) scale(1);
+        }
+
+        .close-button {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            background: #f3f4f6;
+            border: none;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s ease;
+            color: #6b7280;
+            font-size: 18px;
+            line-height: 1;
+            z-index: 1;
+        }
+
+        .close-button:hover {
+            background: #e5e7eb;
+        }
+
+        .close-button:before {
+            content: '\00D7';
+            display: block;
+            font-weight: 300;
+            width: 100%;
+            height: 100%;
+            text-align: center;
+            line-height: 36px;
+            transform: rotate(0deg);
+            transition: transform 0.35s cubic-bezier(0.2,0.9,0.3,1);
+            transform-origin: center center;
+        }
+
+        .profile-header {
+            display: flex;
+            gap: 20px;
+            margin-bottom: 24px;
+            position: relative;
+        }
+
+        .profile-avatar {
+            width: 88px;
+            height: 88px;
+            border-radius: 50%;
+            overflow: hidden;
+            background: linear-gradient(135deg, #e0e7ff 0%, #c7d2fe 100%);
+            flex-shrink: 0;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+        }
+
+        .profile-avatar img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .profile-main-info {
+            flex: 1;
+            text-align: left;
+            padding-top: 12px;
+            padding-right: 40px;
+        }
+
+        .profile-name {
+            font-size: 22px;
+            font-weight: 700;
+            color: #1f2937;
+            margin-bottom: 6px;
+            user-select: text;
+            -webkit-user-select: text;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            hyphens: auto;
+        }
+
+        .profile-details {
+            font-size: 14px;
+            color: #6b7280;
+            user-select: text;
+            -webkit-user-select: text;
+        }
+
+        .profile-bio {
+            background: linear-gradient(135deg, #f9fafb 0%, #f3f4f6 100%);
+            border-radius: 16px;
+            padding: 16px;
+            margin-bottom: 20px;
+            font-size: 14px;
+            color: #4b5563;
+            line-height: 1.6;
+            min-height: 60px;
+            user-select: text;
+            -webkit-user-select: text;
+        }
+
+        .profile-info-item {
+            display: flex;
+            align-items: center;
+            padding: 12px 0;
+            border-bottom: 1px solid #f3f4f6;
+            gap: 12px;
+        }
+
+        .profile-info-item:last-of-type {
+            border-bottom: none;
+        }
+
+        .info-label {
+            font-size: 13px;
+            color: #9ca3af;
+            min-width: 90px;
+            font-weight: 500;
+        }
+
+        .info-value {
+            font-size: 14px;
+            color: #1f2937;
+            font-weight: 600;
+            user-select: text;
+            -webkit-user-select: text;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .id-loading {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            color: #6b7280;
+            font-weight: 400;
+        }
+
+        .id-loading-spinner {
+            width: 12px;
+            height: 12px;
+            border: 1px solid rgba(59, 130, 246, 0.3);
+            border-top: 1px solid #3b82f6;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        .profile-actions {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-top: 24px;
+        }
+
+        .profile-id {
+            flex: 1;
+            font-size: 13px;
+            color: #6b7280;
+            user-select: text;
+            -webkit-user-select: text;
+        }
+
+        .check-date-btn {
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+            border: none;
+            border-radius: 14px;
+            padding: 11px 18px;
+            color: white;
+            font-weight: 600;
+            font-size: 13px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 20px rgba(16, 185, 129, 0.3);
+            white-space: nowrap;
+        }
+
+        .check-date-btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 25px rgba(16, 185, 129, 0.4);
+        }
+
+        .status-message {
+            position: fixed;
+            bottom: 24px;
+            left: 50%;
+            transform: translateX(-50%) translateY(100px);
+            background: white;
+            padding: 14px 24px;
+            border-radius: 14px;
+            box-shadow: 0 12px 32px rgba(0, 0, 0, 0.15);
+            font-size: 14px;
+            font-weight: 500;
+            color: #4b5563;
+            opacity: 0;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            pointer-events: none;
+            z-index: 1001;
+        }
+
+
+        
+        .status-message {
+            opacity: 0;
+            transform: translateX(-50%) translateY(100px);
+            transition: opacity 0.35s ease, transform 0.35s ease;
+        }
+        .status-message.show {
+            opacity: 1 !important;
+            transform: translateX(-50%) translateY(0) !important;
+        }
+        .status-message.success {
+            background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%);
+            color: #16a34a;
+            border: 1px solid #86efac;
+        }
+        .status-message.error {
+            background: linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%);
+            color: #dc2626;
+            border: 1px solid #fca5a5;
+        }
+                .status-message.show {
+            transform: translateX(-50%) translateY(0);
+            opacity: 1;
+        }
+
+        .status-message.error {
+            background: linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%);
+            color: #dc2626;
+            border: 1px solid #fca5a5;
+        }
+
+        .status-message.success {
+            background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%);
+            color: #16a34a;
+            border: 1px solid #86efac;
+        }
+
+        @media (max-width: 615px) {
+            .regdate-header {
+                flex-direction: column;
+                gap: 16px;
+            }
+            
+            .regdate-results {
+                grid-template-columns: 1fr;
+                gap: 16px;
+            }
+            .search-box {
+                max-width: 100%;
+            }
+            .search-input {
+                flex: 1;
+            }
+        }
+
+        @media (max-width: 480px) {
+            .logo {
+                font-size: 40px;
+            }
+            
+            .logo-icon {
+                width: 40px;
+                height: 40px;
+            }
+            
+            .profile-modal, .regdate-card {
+                padding: 24px;
+            }
+        }
+
+
+.content-transition-wrapper {
+    min-height: calc(100vh - 40px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+    z-index: 10;
+    width: 100%;
+    max-width: 800px;
+    transition: all 0.6s ease;
+}
+
+
+.content-container {
+    width: 100%;
+    height: 100%;
+    display: block;
+    box-sizing: border-box;
+}
+
+
+.search-mode-content,
+.regdate-mode-content {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 0 20px;
+    box-sizing: border-box;
+}
+
+
+.search-mode-content.hidden,
+.regdate-mode-content { 
+    opacity: 0;
+    transform: translateY(-20px) scale(0.98);
+    pointer-events: none;
+    visibility: hidden;
+    transition: opacity 0.6s ease, transform 0.6s cubic-bezier(0.23,1,0.32,1);
+}
+
+
+.search-mode-content:not(.hidden),
+.regdate-mode-content.active {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    pointer-events: auto;
+    visibility: visible;
+    transition: opacity 0.6s ease, transform 0.6s cubic-bezier(0.23,1,0.32,1);
+}
+
+
+.regdate-card {
+    width: 100%;
+    max-width: 800px;
+    margin: 0 auto;
+    box-sizing: border-box;
+    max-height: calc(100vh - 160px);
+    overflow: auto;
+}
+
+.search-mode-content .search-box {
+    margin: 0 auto;
+}
+
+
+
+
+.content-transition-wrapper {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    min-height: calc(100vh - 80px) !important; 
+    width: 100% !important;
+    padding: 20px !important;
+    box-sizing: border-box !important;
+}
+
+
+.content-container {
+    width: 100% !important;
+    max-width: 800px !important;
+    margin: 0 auto !important;
+    box-sizing: border-box !important;
+}
+
+
+.search-mode-content,
+.regdate-mode-content {
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: center !important;
+    justify-content: center !important;
+    width: 100% !important;
+    padding: 0 20px !important;
+    box-sizing: border-box !important;
+    visibility: visible;
+}
+
+
+.search-mode-content.hidden,
+.regdate-mode-content:not(.active) {
+    opacity: 0;
+    transform: translateY(-20px) scale(0.98);
+    pointer-events: none;
+    visibility: hidden;
+    transition: opacity 0.6s ease, transform 0.6s cubic-bezier(0.23,1,0.32,1);
+}
+
+
+.search-mode-content:not(.hidden),
+.regdate-mode-content.active {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    pointer-events: auto;
+    visibility: visible;
+    transition: opacity 0.6s ease, transform 0.6s cubic-bezier(0.23,1,0.32,1);
+}
+
+
+.search-mode-content .search-box {
+    margin: 0 auto !important;
+}
+
+
+.regdate-card {
+    width: 100% !important;
+    max-width: 800px !important;
+    margin: 0 auto !important;
+    box-sizing: border-box !important;
+    max-height: calc(100vh - 160px) !important;
+    overflow: auto;
+}
+
+
+@media (max-height: 640px) {
+    .content-transition-wrapper {
+        min-height: calc(100vh - 140px) !important;
+    }
+}
+
+
+
+
+.content-transition-wrapper {
+    height: calc(100vh - 120px) !important;
+    min-height: 0 !important;
+    display: block !important;
+    position: relative !important;
+    padding: 0 20px !important;
+    box-sizing: border-box !important;
+}
+
+
+.search-mode-content,
+.regdate-mode-content {
+    position: absolute !important;
+    left: 0 !important;
+    right: 0 !important;
+    top: 50% !important;
+    transform: translateY(-50%) !important; 
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: center !important;
+    justify-content: center !important;
+    width: 100% !important;
+    padding: 0 20px !important;
+    box-sizing: border-box !important;
+    transition: opacity 0.5s ease, transform 0.5s cubic-bezier(0.23,1,0.32,1) !important;
+    will-change: opacity, transform;
+    z-index: 5 !important;
+}
+
+
+.search-mode-content.hidden,
+.regdate-mode-content:not(.active) {
+    opacity: 0 !important;
+    transform: translateY(calc(-50% - 18px)) !important;
+    pointer-events: none !important;
+    visibility: hidden !important;
+}
+
+
+.search-mode-content:not(.hidden),
+.regdate-mode-content.active {
+    opacity: 1 !important;
+    transform: translateY(-50%) !important;
+    pointer-events: auto !important;
+    visibility: visible !important;
+}
+
+
+.regdate-card {
+    max-height: calc(100vh - 220px) !important;
+    overflow: auto !important;
+    margin: 0 auto !important;
+}
+
+
+
+
+/* разворот креста при hover — маленькая анимация, которая радует глаз.
+   Это микро-удовольствие, которое повышает качество продукта. */
+.close-button:hover:before { transform: rotate(90deg); }
+
+</style>
+</head>
+<body>
+<!-- Cosmic Background Layers -->
+<!-- ФОН: Основной контейнер фоновых слоёв. Содержит несколько независимых слоёв
+     Каждый слой оптимизирован под конкретный режим (search / regdate). -->
+<div class="cosmic-background">
+<div class="bg-layer search-bg"></div>
+<div class="bg-layer regdate-bg"></div>
+</div>
+<!-- Transition Effects -->
+<!-- ВИЗУАЛ: Временная панель переходных эффектов.
+     Здесь создаются звёзды и потоки ветра во время переключения вкладок.
+     Временно показывается и скрывается, не несёт постоянной нагрузки. -->
+<div class="transition-stars" id="transitionStars"></div>
+<!-- Tab Switcher -->
+<!-- UI: Переключатель режимов (верхняя панель). Нажатие на кнопки запускает
+     асинхронные анимации и временно блокирует инпуты (за счёт класса .disabled). -->
+<div class="tab-switcher" id="tabSwitcher">
+<div class="tab-slider" id="tabSlider"></div>
+<div class="tab-option active" id="searchTab">Profile Checker</div>
+<div class="tab-option" id="regdateTab">Registration Date</div>
+</div>
+<!-- Background Elements -->
+<div class="bg-particles" id="particles"></div>
+<div class="stars-container" id="starsContainer"></div>
+<!-- СТАДИЯ: контейнер, центрирующий основной контент (логотип, формы).
+     Здесь происходит абсолютное центрирование и переключение состояний. -->
+<div class="content-transition-wrapper">
+<div class="content-container">
+<!-- Search Mode -->
+<!-- РЕЖИМ: Поиск профиля — главный экран для ввода @username -->
+<div class="search-mode-content" id="searchModeContent">
+<div class="logo">
+<div class="logo-icon">
+<svg fill="none" height="28" viewbox="0 0 24 24" width="28" xmlns="http://www.w3.org/2000/svg">
+<circle cx="11" cy="11" r="8" stroke="#3b82f6" stroke-width="2"></circle>
+<path d="M21 21L16.65 16.65" stroke="#8b5cf6" stroke-linecap="round" stroke-width="2"></path>
+<circle cx="11" cy="11" fill="#3b82f6" opacity="0.3" r="3"></circle>
+</svg>
+</div>
+                    TeleScope
+                </div>
+<p class="tagline">Instant Telegram profile discovery</p>
+<div class="search-box">
+<div class="avatar-wrapper" id="avatarWrapper">
+<div class="user-avatar deleted" id="searchAvatar">
+<svg class="deleted-icon" fill="none" height="24" stroke="white" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" viewbox="0 0 24 24" width="24" xmlns="http://www.w3.org/2000/svg">
+<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+<circle cx="12" cy="7" r="4"></circle>
+</svg>
+</div>
+</div>
+<input autocomplete="off" class="search-input" id="searchInput" placeholder="Enter @username..." type="text"/>
+<button class="search-button" id="searchBtn">View Profile</button>
+</div>
+</div>
+<!-- RegDate Mode -->
+<!-- РЕЖИМ: Расчёт даты регистрации — более "информационная" карточка
+     Показывает оценочную дату, confidence interval и прочие метрики. -->
+<div class="regdate-mode-content" id="regdateModeContent">
+<div class="regdate-card">
+<div class="regdate-header">
+<div class="regdate-left">
+<div class="regdate-title">
+<svg fill="none" height="32" viewbox="0 0 24 24" width="32" xmlns="http://www.w3.org/2000/svg">
+<circle cx="11" cy="11" r="8" stroke="#1e3a8a" stroke-width="2"></circle>
+<path d="M21 21L16.65 16.65" stroke="#1e3a8a" stroke-linecap="round" stroke-width="2"></path>
+<circle cx="11" cy="11" fill="#1e40af" opacity="0.7" r="3"></circle>
+</svg>
+                                TeleScope
+                            </div>
+<input autocomplete="off" class="reg-input" id="regInput" placeholder="Enter Telegram ID..." type="text"/>
+<div style="display: flex; gap: 12px; margin-top: 12px;">
+<button class="get-id-btn" id="getIdBtn">Get User ID</button>
+</div>
+</div>
+<div class="regdate-right">
+<div class="result-item">
+<div class="result-label">Account ID</div>
+<div class="result-value" id="accountId">—</div>
+<div style="margin-top: 12px;">
+<div class="result-label">Estimated Date</div>
+<div class="result-value" id="estimatedDate">—</div>
+<div class="result-subtitle">(approximate)</div>
+</div>
+</div>
+</div>
+</div>
+<div class="regdate-results" id="regdateResults">
+<div class="result-section">
+<div class="result-item">
+<div class="result-label">Confidence Interval (±σ)</div>
+<div class="result-value" id="confidenceInterval">—</div>
+<div style="margin-top: 8px;">
+<div class="result-label">σ (approx.)</div>
+<div class="result-value" id="sigma">— days</div>
+</div>
+</div>
+</div>
+<div class="result-section">
+<div class="result-item">
+<div class="result-label">Confidence Score</div>
+<div class="result-value confidence-score" id="confidenceScore">—%</div>
+<div style="margin-top: 8px;">
+<div class="result-label">Nearest Anchor</div>
+<div class="result-value" id="nearestAnchor">—</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+<!-- Profile Modal -->
+<!-- MODAL: Оверлей модального окна профиля. Показывается поверх всего; 
+     содержит профиль пользователя и кнопки для дополнительных действий. -->
+<div class="modal-overlay" id="modalOverlay">
+<div class="profile-modal">
+<button class="close-button" id="closeModal"></button>
+<div class="profile-header">
+<div class="profile-avatar" id="profileAvatar">
+<img alt="" src=""/>
+</div>
+<div class="profile-main-info">
+<div class="profile-name" id="profileName">Loading...</div>
+<div class="profile-details" id="profileDetails">Loading...</div>
+</div>
+</div>
+<div class="profile-bio" id="profileBio">Loading bio...</div>
+<div class="profile-info-item">
+<span class="info-label">Username:</span>
+<span class="info-value" id="profileUsername">@username</span>
+</div>
+<div class="profile-info-item" id="profileIdItem">
+<span class="info-label">User ID:</span>
+<span class="info-value" id="profileId">
+<span class="id-loading">
+<span class="id-loading-spinner"></span>
+                        Loading...
+                    </span>
+</span>
+<span style="font-size:11px; margin-left:6px;">ID from <a href="https://tg-user.id" style="color:#3b82f6; text-decoration:none; cursor:pointer;" target="_blank">tg-user.id</a> API</span>
+</div>
+<div class="profile-actions">
+<span class="profile-id" id="profileIdSmall">t.me/username</span>
+<span id="separator" style="color: #e5e7eb;">•</span>
+<button class="check-date-btn" id="checkDateBtn">Join date</button>
+</div>
+</div>
+</div>
+<!-- Status Message -->
+<div class="status-message" id="statusMessage"></div>
+<script>
+        // Initialize Telegram Web App
+        const tg = window.Telegram?.WebApp;
+        if (tg) {
+            tg.ready();
+            tg.expand();
+            tg.enableClosingConfirmation();
+            
+            // Detect platform and add class to body
+            const platform = tg.platform || 'unknown';
+            const isMobile = ['android', 'ios', 'android_x'].includes(platform);
+            
+            if (isMobile) {
+                document.body.classList.add('tg-mobile');
+                // Request fullscreen for mobile
+                if (tg.isFullscreen !== undefined && !tg.isFullscreen) {
+                    tg.requestFullscreen();
+                }
+            } else {
+                document.body.classList.add('tg-desktop');
+            }
+            
+            console.log('Platform detected:', platform, 'Mobile:', isMobile);
+        }
+
+        // Global variables
+        let globalCometTimer = null; // globalCometTimer: ID интервала для долгоживущего таймера направления комет (или null).
+        let globalCometStartTime = null; // globalCometStartTime: timestamp начала глобального цикла (ms). Используется для синхронизации фаз.
+        let currentMode = 'search'; // currentMode: состояние интерфейса ('search' или 'regdate'). Влияет на видимость секций и запуск эффектов.
+        let cometDirection = Math.random() < 0.5 ? 'right' : 'left'; // cometDirection: начальное направление комет. Рандом для разнообразия UX при старте.
+        let cometInterval; // cometInterval: ID интервала, который создаёт кометы каждые N миллисекунд (или undefined).
+        let cometTimeout; // cometTimeout: (возможный) вспомогательный таймаут для синхронизации — резервная переменная.
+        let isTransitioning = false; // isTransitioning: флаг блокировки UI на время крупных анимаций, чтобы не было гонок.
+        
+        // Elements
+        const searchTab = document.getElementById('searchTab');
+// DOM: кнопка 'Profile Checker' (верхняя вкладка)
+        const regdateTab = document.getElementById('regdateTab');
+// DOM: кнопка 'Registration Date' (верхняя вкладка)
+        const tabSlider = document.getElementById('tabSlider');
+// DOM: визуальный ползунок стилизованный под active-tab индикатор
+        const tabSwitcher = document.getElementById('tabSwitcher');
+        const searchModeContent = document.getElementById('searchModeContent');
+        const regdateModeContent = document.getElementById('regdateModeContent');
+        const starsContainer = document.getElementById('starsContainer');
+// DOM: контейнер, в который помещаются кометы/звёзды (для режима regdate)
+        const particles = document.getElementById('particles');
+        const transitionStars = document.getElementById('transitionStars');
+
+        // Array for tracking active comets
+        let activeComets = [];
+
+        // Enhanced transition star creation with cosmic wind
+        
+    // Функция: createTransitionStars()
+    // Что делает:
+    // - Очищает контейнер transitionStars и создаёт набор визуальных элементов:
+    //   * маленькие 'transition-star' — одиночные мерцающие точки;
+    //   * 'cosmic-wind' — вертикальные полосы, имитирующие поток (ветер).
+    // Почему это важно:
+    // - Эти элементы видны только во время переключения режимов и ПОСТАРАЕМСЯ
+    //   не держать их постоянно в DOM (создаём при старте и удаляем позже).
+    // Параметры/возврат:
+    // - Нет параметров; управляет DOM напрямую.
+    // Побочные эффекты:
+    // - Может добавить много элементов — при низкой производительности стоит уменьшить количество.
+    // Особенности реализации:
+    // - animationDelay рандомизируется, чтобы создать природный разброс.
+    
+function createTransitionStars() {
+            transitionStars.innerHTML = '';
+            
+            // Create transition stars
+            for (let i = 0; i < 35; i++) {
+                const star = document.createElement('div');
+                star.className = 'transition-star';
+                
+                const size = Math.random() * 6 + 2;
+                star.style.width = size + 'px';
+                star.style.height = size + 'px';
+                star.style.left = Math.random() * 100 + '%';
+                star.style.top = Math.random() * 100 + '%';
+                star.style.animationDelay = Math.random() * 1.5 + 's';
+                
+                transitionStars.appendChild(star);
+            }
+            
+            // Create cosmic wind streams
+            for (let i = 0; i < 25; i++) {
+                const wind = document.createElement('div');
+                wind.className = 'cosmic-wind';
+                
+                const left = Math.random() * 100;
+                const height = Math.random() * 80 + 60;
+                
+                wind.style.left = left + '%';
+                wind.style.height = height + 'px';
+                wind.style.animationDelay = Math.random() * 1.2 + 's';
+                
+                transitionStars.appendChild(wind);
+            }
+        }
+
+        // Enhanced smooth transition functions with cosmic journey
+        
+    // Функция: switchToSearch()
+    // Что делает:
+    // - Переключает UI в режим "search" (поиск профиля).
+    // - Блокирует элементы управления (disabled), запускает transitionStars,
+    //   включает соответствующие CSS-классы на body для перехода фоновых слоёв.
+    // Важные шаги:
+    // 1) Установить isTransitioning = true, чтобы предотвратить параллельные переключения.
+    // 2) Запустить визуальные эффекты (createTransitionStars, transitionStars.active).
+    // 3) Менять DOM-классы в несколько шагов с отложенными setTimeout'ами
+    //    — это даёт секвенирование анимаций (fade-out -> перестройка -> fade-in).
+    // Временные параметры:
+    // - Первый setTimeout (175ms) - быстрая фаза скрытия regdate элементов.
+    // - Второй setTimeout (2350ms) - основной показ search-mode (длинная фаза).
+    // - Финальный setTimeout (3750ms) - полная очистка эффектов и разблокировка UI.
+    // Побочные эффекты:
+    // - Вызывает stopComets() — остановка потока комет (но глобальный таймер сохраняется).
+    // Рекомендации:
+    // - При добавлении тяжелых DOM-операций внутри этих шагов — уменьшить частоты.
+    
+function switchToSearch() {
+            if (currentMode === 'search' || isTransitioning) return;
+            
+            isTransitioning = true;
+            currentMode = 'search';
+            
+            // Disable tab interactions during transition
+            searchTab.classList.add('disabled');
+            regdateTab.classList.add('disabled');
+            tabSwitcher.classList.add('transitioning');
+            
+            // Start enhanced transition effects
+            createTransitionStars();
+            transitionStars.classList.add('active');
+
+            // Add upward cosmic wind direction
+            const windElements = transitionStars.querySelectorAll('.cosmic-wind');
+            setTimeout(() => {
+                windElements.forEach(wind => {
+                    wind.classList.add('up');
+                });
+            }, 150);
+
+            // Start cosmic descent animation (движение вниз)
+            document.body.classList.add('transitioning-to-search');
+            document.body.classList.remove('transitioning-to-regdate');
+            
+            // Update tab visuals
+            tabSlider.classList.remove('regdate');
+            searchTab.classList.add('active');
+            regdateTab.classList.remove('active');
+            
+            // Transition content with earlier fade out
+            setTimeout(() => {
+                regdateModeContent.classList.remove('active');
+                starsContainer.classList.remove('active');
+                particles.classList.remove('hidden');
+                
+                stopComets();
+            }, 175); // Раньше было 1000ms, теперь 300ms
+            
+            setTimeout(() => {
+                searchModeContent.classList.remove('hidden');
+                createParticles();
+            }, 2350); // Увеличил с 800ms до 1400ms для более позднего появления
+            
+            // Complete transition with updated timing
+            setTimeout(() => {
+                transitionStars.classList.remove('active');
+                tabSwitcher.classList.remove('transitioning');
+                searchTab.classList.remove('disabled');
+                regdateTab.classList.remove('disabled');
+                isTransitioning = false;
+            }, 3750); // Увеличил время до 3200ms для соответствия новой длительности
+        }
+
+        
+    // Функция: switchToRegdate()
+    // Что делает:
+    // - Переключает UI в режим "regdate" (оценка даты регистрации).
+    // - Аналогична switchToSearch, но с дополнительной логикой инициализации звёзд и комет.
+    // Ключевые шаги:
+    // 1) Блокировка UI (isTransitioning).
+    // 2) Запуск transitionStars с направлением 'down' (визуальный эффект).
+    // 3) Добавление CSS-классов для фоновых слоёв (document.body).
+    // 4) Через задержку включается regdateModeContent и запускаются createStars().
+    // 5) Инициализация глобального таймера комет (startGlobalCometTimer) если нужно.
+    // Временные параметры/логика:
+    // - Проверяем globalCometStartTime и синхронизируем фазу течения комет.
+    // - Если globalCometStartTime уже есть — вычисляем elapsed и определяем,
+    //   нужно ли немедленно стартовать shower (для согласованного UX).
+    // Побочные эффекты:
+    // - Запускает startCometShower() — может создать большое количество DOM-элементов.
+    // Рекомендации:
+    // - Для слабых устройств уменьшить частоту создания комет (интервал).
+    
+function switchToRegdate() {
+            if (currentMode === 'regdate' || isTransitioning) return;
+            
+            isTransitioning = true;
+            currentMode = 'regdate';
+            
+            // Disable tab interactions during transition
+            searchTab.classList.add('disabled');
+            regdateTab.classList.add('disabled');
+            tabSwitcher.classList.add('transitioning');
+            
+            // Start enhanced transition effects
+            createTransitionStars();
+            transitionStars.classList.add('active');
+            
+            // Add upward cosmic wind direction
+            const windElements = transitionStars.querySelectorAll('.cosmic-wind');
+            setTimeout(() => {
+                windElements.forEach(wind => {
+                    wind.classList.add('down');
+                });
+            }, 200);
+            
+            // Start cosmic ascent animation (движение вверх)
+            document.body.classList.add('transitioning-to-regdate');
+            document.body.classList.remove('transitioning-to-search');
+            
+            // Update tab visuals
+            tabSlider.classList.add('regdate');
+            searchTab.classList.remove('active');
+            regdateTab.classList.add('active');
+            
+            // Transition content with earlier fade out
+            setTimeout(() => {
+                searchModeContent.classList.add('hidden');
+                particles.classList.add('hidden');
+            }, 175); // Раньше было 1000ms, теперь 300ms
+            
+            setTimeout(() => {
+                regdateModeContent.classList.add('active');
+                starsContainer.classList.add('active');
+                createStars();
+                
+                // Start global comet timer if not already running
+                if (!globalCometTimer) {
+                    startGlobalCometTimer();
+                }
+                
+                // Check global timer state
+                const currentTime = Date.now();
+                if (globalCometStartTime) {
+                    const elapsed = currentTime - globalCometStartTime;
+                    const cycleTime = 165000;
+                    const timeInCycle = elapsed % cycleTime;
+                    
+                    if (timeInCycle < 150000) {
+                        startCometShower();
+                    }
+                } else {
+                    startCometShower();
+                }
+            }, 2350); // Увеличил с 800ms до 1400ms для более позднего появления
+            
+            // Complete transition with updated timing
+            setTimeout(() => {
+                transitionStars.classList.remove('active');
+                tabSwitcher.classList.remove('transitioning');
+                searchTab.classList.remove('disabled');
+                regdateTab.classList.remove('disabled');
+                isTransitioning = false;
+            }, 3750); // Увеличил время до 3200ms для соответствия новой длительности
+        }
+
+        searchTab.addEventListener('click', switchToSearch);
+        regdateTab.addEventListener('click', switchToRegdate);
+
+        // Comet creation function with distance checking
+        
+    // Функция: createComet(direction)
+    // Что делает:
+    // - Создаёт DOM-элемент кометы и добавляет в starsContainer, запускает анимацию.
+    // Параметры:
+    // - direction: 'left' | 'right' — откуда стартует хвост кометы.
+    // Алгоритм важных шагов:
+    // - Пытаемся подобрать координаты (left, top) с до 10 попыток,
+    //   чтобы новые кометы не рождались слишком близко к уже активным (minDistance = 400px).
+    // - Записываем объект в activeComets (каждый объект: {left, top, element}).
+    // - Добавляем элемент в DOM и назначаем animationDuration случайно в диапазоне.
+    // - После завершения анимации удаляем элемент и очищаем запись в activeComets.
+    // Гарантии и пределы:
+    // - Если не удаётся найти адекватную позицию за 10 попыток — берём последнее значение.
+    // - animationDuration задаётся в ms: 8000..14000 (8–14s) — обеспечивает плавный полёт.
+    // Ошибки, которые нужно ловить:
+    // - При быстром переключении между режимами может быть гонка удаления/создания.
+    
+function createComet(direction) {
+            let attempts = 0;
+            let validPosition = false;
+            let left, top;
+            
+            while (!validPosition && attempts < 10) {
+                if (direction === 'right') {
+                    left = -200 - Math.random() * 3000;
+                    top = Math.random() * (window.innerHeight * 0.3) - (window.innerHeight * 1);
+                } else {
+                    left = window.innerWidth + 200 + Math.random() * 3000;
+                    top = Math.random() * (window.innerHeight * 0.3) - (window.innerHeight * 1);
+                }
+                
+                validPosition = true;
+                const minDistance = 400;
+                
+                for (let activeComet of activeComets) {
+                    const distance = Math.sqrt(
+                        Math.pow(left - activeComet.left, 2) + 
+                        Math.pow(top - activeComet.top, 2)
+                    );
+                    
+                    if (distance < minDistance) {
+                        validPosition = false;
+                        break;
+                    }
+                }
+                
+                attempts++;
+            }
+            
+            const comet = document.createElement('div');
+            comet.className = `comet ${direction}`;
+            comet.style.left = left + 'px';
+            comet.style.top = top + 'px';
+            
+            const cometData = { left, top, element: comet };
+            activeComets.push(cometData);
+            
+            starsContainer.appendChild(comet);
+            
+            const animationDuration = 8000 + Math.random() * 6000;
+            comet.style.animationDuration = animationDuration + 'ms';
+            comet.style.animationName = `comet-${direction}`;
+            
+            setTimeout(() => {
+                if (comet.parentNode) {
+                    comet.parentNode.removeChild(comet);
+                }
+                activeComets = activeComets.filter(c => c.element !== comet);
+            }, animationDuration + 500);
+        }
+
+        
+    // Функция: startGlobalCometTimer()
+    // Что делает:
+    // - Инициализирует долгоживущий таймер (globalCometTimer), который периодически
+    //   инвертирует направление комет каждые 150000 ms (150s).
+    // Почему так:
+    // - Смена направления даёт ощущение "погоды" и делает сцену живой без вмешательства пользователя.
+    // Важные замечания:
+    // - Если globalCometTimer уже запущен — функция не делает ничего (idempotent).
+    // - При смене направления производится задержка 15000ms перед фактическим изменением,
+    //   чтобы дать время завершить текущую волну комет.
+    
+function startGlobalCometTimer() {
+            if (globalCometTimer) return;
+            
+            console.log('Starting global comet timer...');
+            globalCometStartTime = Date.now();
+            
+            globalCometTimer = setInterval(() => {
+                console.log('Global comet direction change');
+                
+                if (cometInterval) {
+                    clearInterval(cometInterval);
+                    cometInterval = null;
+                }
+                
+                setTimeout(() => {
+                    cometDirection = cometDirection === 'right' ? 'left' : 'right';
+                    console.log('New comet direction:', cometDirection);
+                    
+                    if (currentMode === 'regdate') {
+                        startCometShower();
+                    }
+                }, 15000);
+            }, 150000);
+        }
+
+        
+    // Функция: startCometShower()
+    // Что делает:
+    // - Запускает интервал создания комет: createComet(cometDirection) немедленно,
+    //   затем каждые 225 ms повторяет создание.
+    // Почему 225 ms:
+    // - Баланс между плотностью комет и нагрузкой: каждые 200–300ms создаёт плотное, но управляемое "дождь".
+    // Побочные эффекты:
+    // - Увеличивает количество узлов в DOM; нужно вызывать stopComets() при скрытии режима.
+    
+function startCometShower() {
+            if (cometInterval) clearInterval(cometInterval);
+            
+            console.log('Starting comet shower, direction:', cometDirection);
+            
+            createComet(cometDirection);
+            
+            cometInterval = setInterval(() => {
+                createComet(cometDirection);
+            }, 225);
+        }
+
+        
+    // Функция: stopComets()
+    // Что делает:
+    // - Очищает интервал cometInterval, прекращая генерацию новых комет.
+    // Важно:
+    // - Не останавливает globalCometTimer — это даёт возможность позже возобновить поток
+    //   уже в синхронной фазе (если нужно).
+    
+function stopComets() {
+            console.log('Stopping comet shower (but keeping global timer)...');
+            if (cometInterval) {
+                clearInterval(cometInterval);
+                cometInterval = null;
+            }
+        }
+
+        // Create particles
+        
+    // Функция: createParticles()
+    // Что делает:
+    // - Создаёт небольшой набор фоновых частиц для режима поиска (particles).
+    // Замечание:
+    // - Частицы имеют долгую анимацию (15–25s) и редко перерисовываются,
+    //   поэтому не сильно нагружают CPU, но при больших количествах всё же могут.
+    
+function createParticles() {
+            particles.innerHTML = '';
+            
+            for (let i = 0; i < 35; i++) {
+                const particle = document.createElement('div');
+                particle.className = 'particle';
+                
+                const x = Math.random() * 100;
+                const y = Math.random() * 100;
+                
+                particle.style.left = x + '%';
+                particle.style.top = y + '%';
+                particle.style.animationDelay = Math.random() * 15 + 's';
+                particle.style.animationDuration = (15 + Math.random() * 10) + 's';
+                
+                particles.appendChild(particle);
+            }
+        }
+
+        // Create stars
+        
+    // Функция: createStars()
+    // Что делает:
+    // - Заполняет starsContainer небольшим набором "звёзд", задаёт рандомные размеры и длительности.
+    // - Используется при активации режима regdate (фоновая деталь).
+    // Особенности:
+    // - Хорошо подходит для параллакса и мелких деталей; не влияет на основную логику.
+    
+function createStars() {
+            starsContainer.innerHTML = '';
+            
+            for (let i = 0; i < 100; i++) {
+                const star = document.createElement('div');
+                star.className = 'star';
+                
+                const size = Math.random() * 3 + 1;
+                star.style.width = size + 'px';
+                star.style.height = size + 'px';
+                star.style.left = Math.random() * 100 + '%';
+                star.style.top = Math.random() * 100 + '%';
+                star.style.animationDelay = Math.random() * 3 + 's';
+                star.style.animationDuration = (2 + Math.random() * 4) + 's';
+                
+                starsContainer.appendChild(star);
+            }
+        }
+
+        // Matrix system - completely fixed
+        
+    // Функция: createMatrixField(element, format)
+    // Что делает:
+    // - Генерирует визуальные строки/числа в стиле "матрицы" для имитации загрузки данных
+    //   или демонстрации ID/дат/матриц.
+    // Параметры:
+    // - element: DOM-элемент для вывода;
+    // - format: строковый маркер, определяющий шаблон ('account_id','date','date_range'...).
+    // Замечания:
+    // - Используется только для эффекта — значения рандомизированы для демонстрации.
+    // - Если требуется реальный ID/дата — нужно заменить генератор на реальный источник.
+    
+function createMatrixField(element, format) {
+            let matrixInterval;
+            let isActive = true;
+            let isAnimating = false;
+            let currentMode = 'normal';
+            
+            const patterns = {
+                'account_id': () => Array(10).fill(0).map(() => Math.floor(Math.random() * 10)).join(''),
+                'date': () => {
+                    const dd = String(Math.floor(Math.random() * 28) + 1).padStart(2, '0');
+                    const mm = String(Math.floor(Math.random() * 12) + 1).padStart(2, '0');
+                    const yyyy = String(1990 + Math.floor(Math.random() * 34));
+                    return `${dd}.${mm}.${yyyy}`;
+                },
+                'date_range': () => {
+                    const dd1 = String(Math.floor(Math.random() * 28) + 1).padStart(2, '0');
+                    const mm1 = String(Math.floor(Math.random() * 12) + 1).padStart(2, '0');
+                    const yyyy1 = String(1990 + Math.floor(Math.random() * 34));
+                    const dd2 = String(Math.floor(Math.random() * 28) + 1).padStart(2, '0');
+                    const mm2 = String(Math.floor(Math.random() * 12) + 1).padStart(2, '0');
+                    const yyyy2 = String(1990 + Math.floor(Math.random() * 34));
+                    return `${dd1}.${mm1}.${yyyy1} — ${dd2}.${mm2}.${yyyy2}`;
+                },
+                'number_3': () => String(Math.floor(Math.random() * 1000)),
+                'anchor': () => {
+                    const id = Array(8).fill(0).map(() => Math.floor(Math.random() * 10)).join('');
+                    const yyyy = String(1990 + Math.floor(Math.random() * 34));
+                    const mm = String(Math.floor(Math.random() * 12) + 1).padStart(2, '0');
+                    const dd = String(Math.floor(Math.random() * 28) + 1).padStart(2, '0');
+                    return `ID ${id} — ${yyyy}-${mm}-${dd}`;
+                }
+            };
+            
+            function resetElement() {
+                if (element.dataset.hasRealValue === 'true') {
+                    return;
+                }
+
+                isActive = true;
+                element.dataset.hasRealValue = 'false';
+                element.style.opacity = '0.8';
+                if (element.id === 'confidenceScore' && element.dataset.hasRealValue !== 'true') {
+                    element.style.color = '#1f2937';
+                }
+            }
+            
+            function startMatrix(mode = 'normal') {
+                if (matrixInterval) clearInterval(matrixInterval);
+                
+                currentMode = mode;
+                let interval;
+                
+                if (mode === 'input') {
+                    interval = 33;
+                } else if (mode === 'empty') {
+                    interval = 500;
+                } else {
+                    interval = 500;
+                }
+                
+                matrixInterval = setInterval(() => {
+                    if (element.dataset.hasRealValue === 'true' || isAnimating) {
+                        return;
+                    }
+                    
+                    const pattern = patterns[format];
+                    if (pattern && isActive) {
+                        element.textContent = pattern();
+                        element.style.opacity = '0.8';
+                        
+                        if (mode === 'empty' && element.id === 'confidenceScore') {
+                            element.style.color = '#1f2937';
+                        }
+                    }
+                }, interval);
+            }
+            
+            resetElement();
+            startMatrix('normal');
+            
+            return {
+                stop: () => {
+                    isActive = false;
+                    clearInterval(matrixInterval);
+                },
+                
+                startInputMode: () => {
+                    if (!isAnimating) {
+                        resetElement();
+                        startMatrix('input');
+                    }
+                },
+                
+                startEmptyMode: () => {
+                    const waitForAnimation = () => {
+                        if (isAnimating) {
+                            setTimeout(waitForAnimation, 100);
+                        } else {
+                            resetElement();
+                            startMatrix('empty');
+                        }
+                    };
+                    waitForAnimation();
+                },
+                
+                setAnimating: (animating) => {
+                    isAnimating = animating;
+                    if (!animating) {
+                        resetElement();
+                    }
+                }
+            };
+        }
+
+        // Color scheme for Confidence Score
+        function getConfidenceColor(score) {
+            if (score >= 80) return '#10b981';
+            if (score >= 50) return '#f59e0b';
+            return '#ef4444';
+        }
+
+        let matrixFields = [];
+
+        // RegDate functionality
+        const ANCHORS = [
+            { id: 2768409, date: '2013-11-01' },
+            { id: 7679610, date: '2013-12-31' },
+            { id: 11538514, date: '2014-02-01' },
+            { id: 15835244, date: '2014-02-21' },
+            { id: 23646077, date: '2014-02-27' },
+            { id: 38015510, date: '2014-03-01' },
+            { id: 44634663, date: '2014-05-06' },
+            { id: 46145305, date: '2014-05-16' },
+            { id: 54845238, date: '2014-09-21' },
+            { id: 63263518, date: '2014-10-28' },
+            { id: 101260938, date: '2015-03-06' },
+            { id: 101323197, date: '2015-03-13' },
+            { id: 111220210, date: '2015-04-21' },
+            { id: 103258382, date: '2015-05-28' },
+            { id: 103151531, date: '2015-06-04' },
+            { id: 116812045, date: '2015-07-24' },
+            { id: 122600695, date: '2015-07-25' },
+            { id: 109393468, date: '2015-08-09' },
+            { id: 112594714, date: '2015-08-16' },
+            { id: 124872445, date: '2015-08-18' },
+            { id: 130029930, date: '2015-09-04' },
+            { id: 125828524, date: '2015-10-05' },
+            { id: 133909606, date: '2015-10-07' },
+            { id: 157242073, date: '2015-11-06' },
+            { id: 143445125, date: '2015-11-30' },
+            { id: 148670295, date: '2016-01-08' },
+            { id: 152079341, date: '2016-01-22' },
+            { id: 171295414, date: '2016-03-09' },
+            { id: 181783990, date: '2016-04-10' },
+            { id: 222021233, date: '2016-06-08' },
+            { id: 225034354, date: '2016-06-18' },
+            { id: 278941742, date: '2016-09-10' },
+            { id: 285253072, date: '2016-10-19' },
+            { id: 294851037, date: '2016-11-20' },
+            { id: 297621225, date: '2016-12-16' },
+            { id: 328594461, date: '2016-12-29' },
+            { id: 337808429, date: '2017-02-22' },
+            { id: 341546272, date: '2017-02-23' },
+            { id: 352940995, date: '2017-02-24' },
+            { id: 369669043, date: '2017-03-31' },
+            { id: 400169472, date: '2017-07-31' },
+            { id: 700000000, date: '2018-06-01' },
+            { id: 805158066, date: '2019-07-15' },
+            { id: 1974255900, date: '2021-10-12' },
+            { id: 5520018289, date: '2024-07-24' },
+            { id: 7780125771, date: '2025-04-27' }
+        ];
+
+        function toEpochDays(iso) { 
+            return Math.floor(new Date(iso + 'T00:00:00Z').getTime() / (1000 * 60 * 60 * 24)); 
+        }
+        
+        function fromEpochDays(days) { 
+            const d = new Date(days * 24 * 60 * 60 * 1000); 
+            const yy = d.getUTCFullYear(); 
+            const mm = String(d.getUTCMonth() + 1).padStart(2, '0'); 
+            const dd = String(d.getUTCDate()).padStart(2, '0'); 
+            return `${dd}.${mm}.${yy}`; 
+        }
+
+        const anchors = ANCHORS.slice().map(a => ({ 
+            id: Number(a.id), 
+            days: toEpochDays(a.date), 
+            iso: a.date 
+        })).sort((x, y) => x.id - y.id);
+
+        function buildGlobalRegression(points) {
+            const xs = points.map(p => Math.log(p.id));
+            const ys = points.map(p => p.days);
+            const n = xs.length;
+            const xMean = xs.reduce((s, v) => s + v, 0) / n;
+            const yMean = ys.reduce((s, v) => s + v, 0) / n;
+            let num = 0, den = 0;
+            for (let i = 0; i < n; i++) { 
+                num += (xs[i] - xMean) * (ys[i] - yMean); 
+                den += (xs[i] - xMean) ** 2; 
+            }
+            const slope = num / den; 
+            const intercept = yMean - slope * xMean;
+            const residuals = ys.map((y, i) => y - (slope * xs[i] + intercept));
+            const rss = residuals.reduce((s, r) => s + r * r, 0);
+            const variance = rss / Math.max(1, n - 2);
+            const stdDays = Math.sqrt(variance);
+            return { slope, intercept, stdDays };
+        }
+
+        const GLOBAL_REG = buildGlobalRegression(anchors);
+
+function estimateById(id) {
+            id = Number(id);
+            if (!isFinite(id) || id <= 0) return null;
+            
+            // КРИТИЧНО: Проверяем точное совпадение ПЕРЕД интерполяцией
+            const exactMatch = anchors.find(a => a.id === id);
+            if (exactMatch) {
+                return {
+                    id,
+                    estDays: exactMatch.days,
+                    iso: fromEpochDays(exactMatch.days),
+                    sigma: 0, // Точное совпадение = нулевая погрешность
+                    interval: { low: exactMatch.days, high: exactMatch.days },
+                    confidence: 100,
+                    nearest: exactMatch
+                };
+            }
+            
+            // Если ID меньше первого анкора
+            if (id < anchors[0].id) {
+                const a = anchors[0];
+                const b = anchors[1];
+                return interpNonLinear(a, b, id);
+            }
+            
+            // Ищем сегмент между анкорами
+            for (let i = 0; i < anchors.length - 1; i++) {
+                const a = anchors[i]; 
+                const b = anchors[i + 1];
+                if (id > a.id && id < b.id) {
+                    return interpNonLinear(a, b, id);
+                }
+            }
+            
+            // Если ID больше последнего анкора
+            const last = anchors[anchors.length - 2];
+            const tail = anchors[anchors.length - 1];
+            return interpNonLinear(last, tail, id);
+        }
+
+// Нелинейная интерполяция с учетом плотности ID
+        function interpNonLinear(a, b, id) {
+            // Параметр t от 0 до 1 показывает позицию ID между анкорами
+            const t = (id - a.id) / (b.id - a.id);
+            
+            // Используем ease-in-out для более естественного распределения
+            // В начале и конце сегмента рост медленнее
+            const tSmooth = t < 0.5 
+                ? 2 * t * t 
+                : 1 - Math.pow(-2 * t + 2, 2) / 2;
+            
+            // Вычисляем дату
+            const estDays = Math.round(a.days + tSmooth * (b.days - a.days));
+            
+            // Вычисляем confidence: наивысший в центре сегмента
+            const distanceFromCenter = Math.abs(t - 0.5) * 2; // 0 в центре, 1 на краях
+            
+            // Базовый confidence от позиции в сегменте
+            let confidence = Math.round(95 - Math.pow(distanceFromCenter, 1.5) * 75);
+            
+            // Дополнительный штраф за выход за границы известных анкоров
+            if (t < 0) {
+                // ID меньше первого анкора
+                const extrapolationFactor = Math.abs(t);
+                confidence = Math.round(confidence * Math.exp(-extrapolationFactor * 2));
+            } else if (t > 1) {
+                // ID больше последнего анкора
+                const extrapolationFactor = t - 1;
+                confidence = Math.round(confidence * Math.exp(-extrapolationFactor * 2));
+            }
+            
+            confidence = Math.max(1, Math.min(100, confidence)); // От 1% до 100%
+            
+            // Sigma зависит от размера гэпа и позиции
+            const gapDays = Math.abs(b.days - a.days);
+            const gapIds = Math.abs(b.id - a.id);
+            const localDensity = gapDays / Math.log(gapIds);
+            
+            // Большая погрешность на краях сегмента и в больших гэпах
+            let sigma = Math.round(
+                Math.max(
+                    GLOBAL_REG.stdDays * 0.5,
+                    localDensity * (0.3 + distanceFromCenter * 0.7) * 10
+                )
+            );
+            
+            // Для экстремальных экстраполяций увеличиваем sigma
+            if (t < 0 || t > 1) {
+                const extrapolationDistance = Math.abs(t < 0 ? t : t - 1);
+                sigma = Math.round(sigma * (1 + extrapolationDistance * 5));
+            }
+            
+            const low = estDays - sigma;
+            const high = estDays + sigma;
+            
+            const nearest = (Math.abs(id - a.id) < Math.abs(id - b.id)) ? a : b;
+            
+            // Проверка на разумность дат (1970-2100 примерно)
+            const minReasonableDay = 0;        // 01.01.1970
+            const maxReasonableDay = 47482;    // 01.01.2100
+            
+            let displayEstDays = estDays;
+            let displayLow = low;
+            let displayHigh = high;
+            let displayIso = fromEpochDays(estDays);
+            
+            // Если дата слишком далеко в будущем или прошлом
+            if (estDays < -36500 || estDays > 73000) {
+                // Более 100 лет в прошлое или 200 лет в будущее
+                displayIso = '∞';
+                displayLow = minReasonableDay;
+                displayHigh = maxReasonableDay;
+            }
+            
+            return {
+                id,
+                estDays: displayEstDays,
+                iso: displayIso,
+                sigma,
+                interval: { low: displayLow, high: displayHigh },
+                confidence,
+                nearest
+            };
+        }
+
+        function animateNumber(element, finalValue, callback, duration = 2000) {
+            const chars = finalValue.toString().split('');
+
+            element.style.opacity = '0';
+            element.style.transform = 'scale(0.98)';
+
+            setTimeout(() => {
+                element.style.opacity = '0.8';
+                element.style.transform = 'scale(1)';
+
+                const tempSpans = chars.map(() => {
+                    const span = document.createElement('span');
+                    span.className = 'matrix-number';
+                    span.textContent = Math.floor(Math.random() * 10);
+                    return span;
+                });
+
+                element.innerHTML = '';
+                tempSpans.forEach(span => element.appendChild(span));
+
+                const animationSteps = 60;
+                const stepDuration = duration / animationSteps;
+                let currentStep = 0;
+
+                const interval = setInterval(() => {
+                    tempSpans.forEach((span, index) => {
+                        const progress = currentStep / animationSteps;
+                        const shouldReveal = progress > (index / chars.length);
+
+                        if (shouldReveal) {
+                            span.textContent = chars[index];
+                            span.classList.remove('flickering');
+                        } else {
+                            span.textContent = Math.floor(Math.random() * 10);
+                            span.classList.add('flickering');
+                        }
+                    });
+
+                    currentStep++;
+                    if (currentStep > animationSteps) {
+                        clearInterval(interval);
+                        tempSpans.forEach((span, index) => {
+                            span.textContent = chars[index];
+                            span.classList.remove('flickering');
+                        });
+                        if (callback) callback();
+                    }
+                }, stepDuration);
+                
+            }, 125);
+        }
+
+        // RegDate input handling
+        const regInput = document.getElementById('regInput');
+        const accountId = document.getElementById('accountId');
+        const estimatedDate = document.getElementById('estimatedDate');
+        const regdateResults = document.getElementById('regdateResults');
+        const confidenceInterval = document.getElementById('confidenceInterval');
+        const sigma = document.getElementById('sigma');
+        const confidenceScore = document.getElementById('confidenceScore');
+        const nearestAnchor = document.getElementById('nearestAnchor');
+
+        let regSearchTimeout;
+
+        regInput.addEventListener('input', () => {
+            const raw = regInput.value.trim();
+            
+            if (!raw) {
+                clearTimeout(regSearchTimeout);
+                matrixFields.forEach(field => field.startEmptyMode());
+                return;
+            }
+            
+            matrixFields.forEach(field => field.startInputMode());
+            
+            clearTimeout(regSearchTimeout);
+            regSearchTimeout = setTimeout(() => {
+                const digits = raw.replace(/\D/g, '');
+                if (!digits) return;
+                
+                const id = Number(digits);
+                const result = estimateById(id);
+                
+                if (!result) return;
+                
+                matrixFields.forEach(field => field.stop());
+                matrixFields.forEach(field => field.setAnimating(true));
+                
+                const scoreColor = getConfidenceColor(result.confidence);
+                confidenceScore.style.color = scoreColor;
+                
+                animateNumber(accountId, result.id, () => {
+                    accountId.dataset.hasRealValue = 'true';
+                });
+                animateNumber(estimatedDate, result.iso, () => {
+                    estimatedDate.dataset.hasRealValue = 'true';
+                });
+                animateNumber(confidenceInterval, `${fromEpochDays(result.interval.low)} — ${fromEpochDays(result.interval.high)}`, () => {
+                    confidenceInterval.dataset.hasRealValue = 'true';
+                });
+                animateNumber(sigma, result.sigma, () => {
+                    sigma.dataset.hasRealValue = 'true';
+                });
+                
+                animateNumber(confidenceScore, result.confidence, () => {
+                    confidenceScore.dataset.hasRealValue = 'true';
+                    const finalColor = getConfidenceColor(result.confidence);
+                    confidenceScore.style.color = finalColor;
+                });
+                
+                animateNumber(nearestAnchor, `ID ${result.nearest.id} — ${result.nearest.iso}`, () => {
+                    nearestAnchor.dataset.hasRealValue = 'true';
+                    matrixFields.forEach(field => field.setAnimating(false));
+                });
+            }, 500);
+        });
+
+        // Initialize matrix fields
+        function initializeMatrixFields() {
+            const accountIdField = createMatrixField(accountId, 'account_id');
+            const estimatedDateField = createMatrixField(estimatedDate, 'date');
+            const confidenceIntervalField = createMatrixField(confidenceInterval, 'date_range');
+            const sigmaField = createMatrixField(sigma, 'number_3');
+            const confidenceScoreField = createMatrixField(confidenceScore, 'number_3');
+            const nearestAnchorField = createMatrixField(nearestAnchor, 'anchor');
+            
+            accountIdField.element = accountId;
+            estimatedDateField.element = estimatedDate;
+            confidenceIntervalField.element = confidenceInterval;
+            sigmaField.element = sigma;
+            confidenceScoreField.element = confidenceScore;
+            nearestAnchorField.element = nearestAnchor;
+            
+            matrixFields = [
+                accountIdField,
+                estimatedDateField,
+                confidenceIntervalField,
+                sigmaField,
+                confidenceScoreField,
+                nearestAnchorField
+            ];
+        }
+
+        // Search functionality
+        const searchInput = document.getElementById('searchInput');
+        const searchBtn = document.getElementById('searchBtn');
+        const searchAvatar = document.getElementById('searchAvatar');
+        const modalOverlay = document.getElementById('modalOverlay');
+        const closeModal = document.getElementById('closeModal');
+        const statusMessage = document.getElementById('statusMessage');
+        const checkDateBtn = document.getElementById('checkDateBtn');
+
+        let searchTimeout;
+        let currentUser = null;
+        let lastSearch = '';
+        let isLoading = false;
+        let isSearching = false;
+        let isDebouncing = false;
+
+        (function() {
+                let statusTimeout = null; // Отслеживаем активный таймер
+                let isShowingStatus = false; // Отслеживаем, отображается ли сообщение
+
+                window.showStatus = function(message, type = 'info') {
+                        const statusMessage = document.getElementById('statusMessage');
+
+                        // Очищаем существующий таймер, чтобы избежать наложения
+                        if (statusTimeout) {
+                                clearTimeout(statusTimeout);
+                                statusTimeout = null;
+                        }
+
+                        // Если сообщение уже отображается, ждём завершения затухания
+                        if (isShowingStatus) {
+                                statusMessage.classList.remove('show');
+                                // Ждём завершения CSS-перехода (0.35с)
+                                setTimeout(() => {
+                                        displayStatus(message, type);
+                                }, 350);
+                        } else {
+                                displayStatus(message, type);
+                        }
+                };
+
+                function displayStatus(message, type) {
+                        const statusMessage = document.getElementById('statusMessage');
+                        statusMessage.textContent = message;
+                        statusMessage.className = `status-message show ${type}`;
+                        isShowingStatus = true;
+
+                        statusTimeout = setTimeout(() => {
+                                statusMessage.classList.remove('show');
+                                isShowingStatus = false;
+                                statusTimeout = null;
+                        }, 1500);
+                }
+        })();
+
+        function updateSearchAvatar(state, userData = null) {
+            switch(state) {
+                case 'empty':
+                    searchAvatar.className = 'user-avatar deleted';
+                    searchAvatar.innerHTML = `
+                        <svg class="deleted-icon" xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>
+                            <path d='M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2'></path>
+                            <circle cx='12' cy='7' r='4'></circle>
+                        </svg>`;
+                    searchBtn.disabled = true;
+                    break;
+                    
+                case 'loading':
+                    searchAvatar.className = 'user-avatar loading';
+                    searchAvatar.innerHTML = '<div class="loading-icon"></div>';
+                    searchBtn.disabled = true;
+                    break;
+                    
+                case 'not_found':
+                    searchAvatar.className = 'user-avatar deleted';
+                    searchAvatar.innerHTML = `
+                        <svg class="deleted-icon" xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>
+                            <path d='M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2'></path>
+                            <circle cx='12' cy='7' r='4'></circle>
+                        </svg>`;
+                    searchBtn.disabled = false;
+                    break;
+                    
+                case 'error':
+                    searchAvatar.className = 'user-avatar error';
+                    searchAvatar.innerHTML = '<span class="error-icon">&times;</span>';
+                    searchBtn.disabled = false;
+                    break;
+                    
+                case 'found':
+                    if (userData.photo) {
+                        searchAvatar.className = 'user-avatar has-image';
+                        searchAvatar.innerHTML = `<img src="${userData.photo}" alt="${userData.first_name}" onerror="this.parentElement.innerHTML='<svg class=deleted-icon xmlns=http://www.w3.org/2000/svg width=24 height=24 viewBox=0 0 24 24 fill=none stroke=white stroke-width=2 stroke-linecap=round stroke-linejoin=round><path d=M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2></path><circle cx=12 cy=7 r=4></circle></svg>'; this.parentElement.className='user-avatar no-photo';">`;
+                    } else {
+                        searchAvatar.className = 'user-avatar no-photo';
+                        searchAvatar.innerHTML = `
+                            <svg class="deleted-icon" xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>
+                                <path d='M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2'></path>
+                                <circle cx='12' cy='7' r='4'></circle>
+                            </svg>`;
+                    }
+                    searchBtn.disabled = false;
+                    break;
+            }
+        }
+
+        async function getUserIdFromAPI(username) {
+            const cleanUsername = username.replace(/^@/, '');
+            const cacheKey = `userid_${cleanUsername}`;
+            
+            try {
+                const cachedId = localStorage.getItem(cacheKey);
+                if (cachedId && cachedId !== 'null') {
+                    return cachedId;
+                }
+            } catch (e) {
+                console.log('localStorage недоступен');
+            }
+            
+            try {
+                const response = await fetch(`https://telescop-api.asatswarb.workers.dev/?username=${cleanUsername}`);
+
+                if (response.ok) {
+                    const data = await response.json();
+                    let userId = null;
+                    if (data.user_id) {
+                        userId = data.user_id.toString();
+                    } else if (data.id) {
+                        userId = data.id.toString();
+                    } else if (data.userId) {
+                        userId = data.userId.toString();
+                    }
+                    
+                    if (userId) {
+                        try {
+                            localStorage.setItem(cacheKey, userId);
+                        } catch (e) {}
+                    }
+                    
+                    return userId;
+                }
+                
+                return null;
+            } catch (error) {
+                return null;
+            }
+        }
+
+        async function searchTelegramUser(username) {
+            if (!username || isSearching) {
+                if (!username) {
+                    updateSearchAvatar('empty');
+                    currentUser = null;
+                }
+                return;
+            }
+            
+            isSearching = true;
+            updateSearchAvatar('loading');
+            isLoading = true;
+            
+            try {
+                const user = await getTelegramUserInfo(username);
+                
+                if (user) {
+                    currentUser = user;
+                    updateSearchAvatar('found', user);
+                    if (tg?.HapticFeedback) {
+                        tg.HapticFeedback.selectionChanged();
+                    }
+                    showStatus(`Found: ${user.first_name}`, 'success');
+                } else {
+                    currentUser = null;
+                    updateSearchAvatar('not_found');
+                    showStatus('User not found', 'error');
+                }
+            } catch (error) {
+                console.error('Search error:', error);
+                currentUser = null;
+                updateSearchAvatar('not_found');
+                showStatus('Search error', 'error');
+            } finally {
+                isLoading = false;
+                isSearching = false;
+            }
+        }
+
+        async function getTelegramUserInfo(username) {
+            const cleanUsername = username.replace(/^@/, '');
+            
+            const corsProxies = [
+                {
+                    url: 'https://api.allorigins.win/get?url=',
+                    parseResponse: async (response) => {
+                        const data = await response.json();
+                        return data.contents;
+                    }
+                },
+                {
+                    url: 'https://corsproxy.io/?',
+                    parseResponse: async (response) => {
+                        return await response.text();
+                    }
+                }
+            ];
+            
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 8000);
+            
+            try {
+                for (const proxy of corsProxies) {
+                    try {
+                        const url = `${proxy.url}${encodeURIComponent(`https://t.me/${cleanUsername}`)}`;
+                        
+                        const response = await fetch(url, {
+                            method: 'GET',
+                            headers: {
+                                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                            },
+                            signal: controller.signal
+                        });
+                        
+                        if (response.ok) {
+                            const html = await proxy.parseResponse(response);
+                            
+                            const user = parseProfileFromHTML(html, cleanUsername);
+                            if (user && !user.isMainPage) {
+                                clearTimeout(timeoutId);
+                                return user;
+                            } else if (user && user.isMainPage) {
+                                clearTimeout(timeoutId);
+                                return null;
+                            }
+                        }
+                    } catch (error) {
+                        if (error.name === 'AbortError') {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+                
+                clearTimeout(timeoutId);
+                return null;
+            } catch (error) {
+                clearTimeout(timeoutId);
+                throw error;
+            }
+        }
+
+        function parseProfileFromHTML(html, username) {
+            try {
+                const isMainPage = html.includes('Telegram — a new era of messaging') ||
+                                 html.includes('Telegram — a new era of messaging') ||
+                                 html.includes('Fast. Secure. Powerful.');
+
+                if (isMainPage) {
+                    return { isMainPage: true };
+                }
+
+                const hasRealProfile = html.includes('tgme_page_photo') || 
+                                     html.includes('tgme_page_title') ||
+                                     html.includes('profile_photo');
+
+                if (!hasRealProfile) {
+                    const isNonExistentUser = html.includes('If you have <strong>Telegram</strong>, you can contact') ||
+                                            html.includes('If you have **Telegram**, you can contact');
+
+                    if (isNonExistentUser) {
+                        return null;
+                    }
+                    return null;
+                }
+
+                const titleMatch = html.match(/<meta[^>]*property=["']og:title["'][^>]*content=["']([^"']*?)["']/i);
+                const descMatch = html.match(/<meta[^>]*property=["']og:description["'][^>]*content=["']([^"']*?)["']/i);
+                const imageMatch = html.match(/<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']*?)["']/i);
+
+                let title = '';
+                let description = '';
+                let image = '';
+
+                if (titleMatch && titleMatch[1]) {
+                    title = titleMatch[1];
+                }
+
+                if (descMatch && descMatch[1]) {
+                    description = descMatch[1];
+                }
+
+                if (imageMatch && imageMatch[1]) {
+                    image = imageMatch[1];
+                }
+
+                if (title && title.trim() && title !== 'Telegram') {
+                    const cleanTitle = decodeHtmlEntities(title.trim());
+                    const cleanDesc = decodeHtmlEntities(description.trim());
+
+                    const nameParts = cleanTitle.split(' ');
+                    const first_name = nameParts[0] || username;
+                    const last_name = nameParts.slice(1).join(' ') || '';
+
+                    let type = 'private';
+                    let memberCount = null;
+                    const lowDesc = cleanDesc.toLowerCase();
+                    const lowTitle = cleanTitle.toLowerCase();
+
+                    const subscribersMatch = cleanDesc.match(/(\d+(?:[\s,]?\d+)*)\s*subscribers?/i) ||
+                                           html.match(/(\d+(?:[\s,]?\d+)*)\s*subscribers?/i);
+                    const membersMatch = cleanDesc.match(/(\d+(?:[\s,]?\d+)*)\s*members?/i) ||
+                                       html.match(/(\d+(?:[\s,]?\d+)*)\s*members?/i);
+                    const onlineMatch = html.match(/(\d+(?:[\s,]?\d+)*)\s*online/i);
+
+                    const isBotByButton = html.includes('Start Bot') || html.includes('start bot');
+                    const isBotByUsername = username.toLowerCase().endsWith('bot');
+
+                    if (isBotByButton || isBotByUsername) {
+                        type = 'bot';
+                    } else if (subscribersMatch) {
+                        type = 'channel';
+                        memberCount = subscribersMatch[1].replace(/[\s,]/g, '');
+                    } else if (membersMatch) {
+                        type = 'group';
+                        memberCount = membersMatch[1].replace(/[\s,]/g, '');
+                    } else if (lowDesc.includes('channel') || lowDesc.includes('канал')) {
+                        type = 'channel';
+                    } else if (lowDesc.includes('group') || lowDesc.includes('группа') || onlineMatch) {
+                        type = 'group';
+                    }
+
+                    let profilePhoto = image;
+                    if (!image || image.includes('telegram.org') || image.includes('static') || image === '') {
+                        profilePhoto = null;
+                    }
+
+                    return {
+                        first_name,
+                        last_name,
+                        username: username,
+                        bio: cleanDesc || 'No description available',
+                        type,
+                        memberCount,
+                        photo: profilePhoto,
+                        is_verified: cleanTitle.includes('✓') || cleanDesc.includes('verified'),
+                        isMainPage: false
+                    };
+                }
+
+                return null;
+            } catch (error) {
+                console.error('Parse error:', error);
+                return null;
+            }
+        }
+
+        function decodeHtmlEntities(text) {
+            const textarea = document.createElement('textarea');
+            textarea.innerHTML = text;
+            return textarea.value;
+        }
+
+        function formatMemberCount(count) {
+            if (!count) return '';
+
+            const num = parseInt(count);
+            if (num >= 1000000) {
+                return (num / 1000000).toFixed(1).replace('.0', '') + 'M';
+            } else if (num >= 1000) {
+                return (num / 1000).toFixed(1).replace('.0', '') + 'K';
+            }
+            return num.toLocaleString();
+        }
+
+        function performSearch() {
+            const query = searchInput.value.trim().replace(/^@/, '');
+
+            if (query === lastSearch || isSearching) return;
+
+            clearTimeout(searchTimeout);
+
+            if (!query) {
+                updateSearchAvatar('empty');
+                currentUser = null;
+                lastSearch = '';
+                isDebouncing = false;
+                return;
+            }
+
+            isDebouncing = true;
+            searchBtn.disabled = true;
+
+            searchTimeout = setTimeout(() => {
+                if (query === searchInput.value.trim().replace(/^@/, '')) {
+                    lastSearch = query;
+                    isDebouncing = false;
+                    searchTelegramUser(query);
+                } else {
+                    isDebouncing = false;
+                    if (currentUser) {
+                        searchBtn.disabled = false;
+                    }
+                }
+            }, 750);
+        }
+
+        async function loadUserIdInModal(username) {
+            const profileIdElement = document.getElementById('profileId');
+
+            profileIdElement.innerHTML = `
+                <span class="id-loading">
+                    <span class="id-loading-spinner"></span>
+                    Loading ID...
+                </span>
+            `;
+
+            try {
+                const userId = await getUserIdFromAPI(username);
+
+                if (userId) {
+                    profileIdElement.innerHTML = userId;
+                    if (currentUser) {
+                        currentUser.id = userId;
+                    }
+                } else {
+                    profileIdElement.innerHTML = '<span style="color: #1f2937;">ID not found</span>';
+                }
+            } catch (error) {
+                console.error('Error loading user ID:', error);
+                profileIdElement.innerHTML = '<span style="color: #ef4444;">ID load error</span>';
+            }
+        }
+
+        function showProfile() {
+            if (isLoading || isSearching) {
+                showStatus('Search in progress...', 'info');
+                return;
+            }
+
+            if (isDebouncing) {
+                showStatus('Wait for input to complete...', 'info');
+                return;
+            }
+
+            if (!currentUser) {
+                updateSearchAvatar('error');
+                showStatus('Profile not found', 'error');
+                if (tg?.HapticFeedback) {
+                    tg.HapticFeedback.notificationOccurred('error');
+                }
+                return;
+            }
+
+            if (currentUser.photo) {
+                document.getElementById('profileAvatar').innerHTML = `<img src="${currentUser.photo}" alt="${currentUser.first_name}" onerror="this.parentElement.innerHTML='<svg xmlns=http://www.w3.org/2000/svg width=60 height=60 viewBox=0 0 24 24 fill=none stroke=currentColor stroke-width=1.5 stroke-linecap=round stroke-linejoin=round style=color:white><path d=M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2></path><circle cx=12 cy=7 r=4></circle></svg>'; this.parentElement.style.background='linear-gradient(135deg, #7dd3fc 0%, #2563eb 100%)'; this.parentElement.style.display='flex'; this.parentElement.style.alignItems='center'; this.parentElement.style.justifyContent='center';">`;
+            } else {
+                document.getElementById('profileAvatar').innerHTML = `
+                    <svg xmlns='http://www.w3.org/2000/svg' width='60' height='60' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round' style='color: white'>
+                        <path d='M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2'></path>
+                        <circle cx='12' cy='7' r='4'></circle>
+                    </svg>`;
+                document.getElementById('profileAvatar').style.background = 'linear-gradient(135deg, #7dd3fc 0%, #2563eb 100%)';
+                document.getElementById('profileAvatar').style.display = 'flex';
+                document.getElementById('profileAvatar').style.alignItems = 'center';
+                document.getElementById('profileAvatar').style.justifyContent = 'center';
+            }
+
+            document.getElementById('profileName').textContent = `${currentUser.first_name} ${currentUser.last_name || ''}`.trim();
+
+            let details = [];
+            if (currentUser.is_verified) details.push('✓ Verified');
+
+            if (currentUser.type === 'bot') {
+                details.push('Bot');
+            } else if (currentUser.type === 'channel') {
+                let channelInfo = 'Channel';
+                if (currentUser.memberCount) {
+                    const formattedCount = formatMemberCount(currentUser.memberCount);
+                    channelInfo += ` • ${formattedCount} subscribers`;
+                }
+                details.push(channelInfo);
+            } else if (currentUser.type === 'group') {
+                let groupInfo = 'Group';
+                if (currentUser.memberCount) {
+                    const formattedCount = formatMemberCount(currentUser.memberCount);
+                    groupInfo += ` • ${formattedCount} members`;
+                }
+                details.push(groupInfo);
+            }
+
+            document.getElementById('profileDetails').textContent = details.join(' • ') || 'User';
+
+            const bioText = currentUser.bio && currentUser.bio !== 'No description available' 
+                ? `Bio: ${currentUser.bio}` 
+                : 'Bio: No description available';
+            document.getElementById('profileBio').textContent = bioText;
+
+            document.getElementById('profileUsername').textContent = `@${currentUser.username}`;
+            document.getElementById('profileIdSmall').textContent = `t.me/${currentUser.username}`;
+
+            const separator = document.getElementById('separator');
+            if (currentUser.type === 'channel' || currentUser.type === 'group' || currentUser.type === 'bot') {
+                checkDateBtn.style.display = 'none';
+                separator.style.display = 'none';
+            } else {
+                checkDateBtn.style.display = 'block';
+                separator.style.display = 'none';
+            }
+
+            modalOverlay.classList.add('show');
+
+            loadUserIdInModal(currentUser.username);
+
+            if (tg?.HapticFeedback) {
+                tg.HapticFeedback.impactOccurred('light');
+            }
+
+            showStatus('Profile loaded!', 'success');
+        }
+
+        // Events
+        searchBtn.addEventListener('click', showProfile);
+        
+        searchInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                if (currentUser && !isLoading && !isSearching && !isDebouncing) {
+                    showProfile();
+                } else if (!isLoading && !isSearching && !isDebouncing) {
+                    const query = searchInput.value.trim().replace(/^@/, '');
+                    if (query) {
+                        clearTimeout(searchTimeout);
+                        lastSearch = query;
+                        searchTelegramUser(query);
+                    }
+                }
+            }
+        });
+
+        searchInput.addEventListener('input', (e) => {
+            const currentValue = e.target.value.trim().replace(/^@/, '');
+            
+            if (!currentValue) {
+                clearTimeout(searchTimeout);
+                updateSearchAvatar('empty');
+                currentUser = null;
+                lastSearch = '';
+                isSearching = false;
+                isDebouncing = false;
+                return;
+            }
+            
+            if (currentValue !== lastSearch && !isSearching) {
+                performSearch();
+            }
+        });
+
+        searchInput.addEventListener('focus', () => {
+            const query = searchInput.value.trim().replace(/^@/, '');
+            if (query && query !== lastSearch && !isSearching) {
+                performSearch();
+            }
+        });
+
+        closeModal.addEventListener('click', () => {
+            modalOverlay.classList.remove('show');
+        });
+
+        modalOverlay.addEventListener('click', (e) => {
+            if (e.target === modalOverlay) {
+                modalOverlay.classList.remove('show');
+            }
+        });
+
+        checkDateBtn.addEventListener('click', () => {
+            showStatus('Registration date analysis... Coming soon!', 'info');
+            if (tg?.HapticFeedback) {
+                tg.HapticFeedback.notificationOccurred('warning');
+            }
+        });
+
+        // Get User ID button handler
+        const getIdBtn = document.getElementById('getIdBtn');
+        getIdBtn.addEventListener('click', () => {
+            switchToSearch();
+        });
+
+        // Initialize
+        createParticles();
+        updateSearchAvatar('empty');
+        initializeMatrixFields(); 
+        
+        if (tg) {
+            tg.onEvent('themeChanged', () => {
+                console.log('Theme changed:', tg.colorScheme);
+            });
+        }
+
+        setTimeout(() => {
+            showStatus('Enter username to search profile', 'info');
+        }, 1000);
+    
+// === Join date automated behavior ===
+(function(){
+    const joinBtn = document.getElementById('checkDateBtn');
+    const modal = document.getElementById('modalOverlay');
+    const regTab = document.getElementById('regdateTab');
+    const regInput = document.getElementById('regInput');
+    const getIdBtn = document.getElementById('getIdBtn');
+    const profileIdEl = document.getElementById('profileId');
+
+    if (joinBtn) {
+        joinBtn.addEventListener('click', () => {
+            // retrieve ID text (prefer numeric content)
+            let idText = profileIdEl ? profileIdEl.textContent.trim() : '';
+            if (!idText) return;
+            // normalize (remove non-digits)
+            const digits = idText.replace(/\D+/g, '');
+            idText = digits || idText;
+
+            // close modal smoothly
+            if (modal) {
+                modal.classList.remove('show');
+            }
+            // switch to regdate tab
+            if (regTab) regTab.click();
+
+            // wait for tab transition, then fill input and click getIdBtn
+            setTimeout(() => {
+                if (regInput) {
+                    regInput.focus();
+                    regInput.value = idText;
+                    // dispatch input event so any listeners react
+                    const ev = new Event('input', { bubbles: true });
+                    regInput.dispatchEvent(ev);
+                }
+                if (getIdBtn) {
+                    // small delay to allow UI to settle
+                    setTimeout(() => {
+                        getIdBtn.click();
+                    }, 250);
+                }
+            }, 600);
+        });
+    }
+})();
+
+</script>
+<!-- Assistant: queue-based strong shake + vibration (animations complete, don't stack) -->
+<style>
+/* .status-message { 
+    display: none !important; 
+    pointer-events: none !important;
+    opacity: 0 !important;
+} */
+#profileId, #profileIdSmall { 
+    user-select: none !important; 
+    -webkit-user-select: none !important; 
+    -moz-user-select: none !important; 
+    -ms-user-select: none !important; 
+}
+@keyframes ts-strong-shake {
+    0% { transform: translateX(0); }
+    20% { transform: translateX(-10px); }
+    40% { transform: translateX(10px); }
+    60% { transform: translateX(-6px); }
+    80% { transform: translateX(6px); }
+    100% { transform: translateX(0); }
+}
+.ts-copy-error {
+    animation: ts-strong-shake 260ms cubic-bezier(.36,.07,.19,.97);
+}
+</style>
+<script>
+(function(){
+    const shakeKeyframes = [
+        { transform: 'translateX(0)' },
+        { transform: 'translateX(-10px)' },
+        { transform: 'translateX(10px)' },
+        { transform: 'translateX(-6px)' },
+        { transform: 'translateX(6px)' },
+        { transform: 'translateX(0)' }
+    ];
+    const shakeTiming = { duration: 260, easing: 'cubic-bezier(.36,.07,.19,.97)', iterations: 1 };
+
+    let lastVibrateAt = 0;
+    const VIBRATE_MIN_INTERVAL = 50; 
+    const MAX_QUEUE_LENGTH = 1; 
+
+    function doVibrate(pattern) {
+        if (!('vibrate' in navigator)) return;
+        const now = Date.now();
+        if (now - lastVibrateAt < VIBRATE_MIN_INTERVAL) return;
+        try {
+            navigator.vibrate(pattern);
+            lastVibrateAt = now;
+        } catch (e) {}
+    }
+
+    function enqueueShake(el, isError) {
+        if (!el) return;
+        if (!el._tsQueue) el._tsQueue = [];
+        if (el._tsQueue.length >= MAX_QUEUE_LENGTH) {
+            el._tsQueue.shift();
+        }
+        el._tsQueue.push(Boolean(isError));
+        if (!el._tsAnimating) processQueue(el);
+    }
+
+    function processQueue(el) {
+        if (!el) return;
+        if (!el._tsQueue || el._tsQueue.length === 0) {
+            el._tsAnimating = false;
+            return;
+        }
+        el._tsAnimating = true;
+        var isError = el._tsQueue.shift();
+
+        doVibrate(isError ? [60,20,60] : 40);
+
+        if (el.animate) {
+            try {
+                var anim = el.animate(shakeKeyframes, shakeTiming);
+                el._tsCurrentAnim = anim;
+                anim.onfinish = function() {
+                    if (el._tsCurrentAnim === anim) el._tsCurrentAnim = null;
+                    if (isError) {
+                        el.classList.add('ts-copy-error');
+                        setTimeout(function(){ el.classList.remove('ts-copy-error'); }, 300);
+                    }
+                    setTimeout(function(){ processQueue(el); }, 10);
+                };
+                anim.oncancel = function() {
+                    if (el._tsCurrentAnim === anim) el._tsCurrentAnim = null;
+                    setTimeout(function(){ processQueue(el); }, 10);
+                };
+            } catch (e) {
+                fallbackCssShake(el, isError, function(){ processQueue(el); });
+            }
+        } else {
+            fallbackCssShake(el, isError, function(){ processQueue(el); });
+        }
+    }
+
+    function fallbackCssShake(el, isError, cb) {
+        el.classList.remove('ts-copy-error');
+        void el.offsetWidth;
+        if (isError) el.classList.add('ts-copy-error');
+        setTimeout(function(){
+            el.classList.remove('ts-copy-error');
+            try { cb(); } catch(e) {}
+        }, 300);
+    }
+
+    function getTextFromElement(el) {
+        if (!el) return '';
+        if (el.dataset && el.dataset.copy) return el.dataset.copy.trim();
+        return el.textContent.trim();
+    }
+
+function setupCopyForElement(el) {
+        if (!el) return;
+        el.style.cursor = 'pointer';
+        el.setAttribute('tabindex','0');
+
+        el.addEventListener('click', function(e){
+            e.stopPropagation && e.stopPropagation();
+            var text = getTextFromElement(el);
+            if (!text) return;
+
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).then(function(){
+                    enqueueShake(el, false);
+                    
+                    // Добавляем уведомления
+                    if (el.id === 'profileId') {
+                        showStatus('ID copied!', 'success');
+                    } else if (el.id === 'profileIdSmall') {
+                        showStatus('Link copied!', 'success');
+                    }
+                }).catch(function(){
+                    enqueueShake(el, true);
+                    showStatus('Failed to copy', 'error');
+                });
+            } else {
+                try {
+                    var ta = document.createElement('textarea');
+                    ta.value = text;
+                    ta.setAttribute('readonly','');
+                    ta.style.position = 'absolute';
+                    ta.style.left = '-9999px';
+                    document.body.appendChild(ta);
+                    ta.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(ta);
+                    enqueueShake(el, false);
+                    
+                    // Добавляем уведомления для fallback
+                    if (el.id === 'profileId') {
+                        showStatus('ID copied!', 'success');
+                    } else if (el.id === 'profileIdSmall') {
+                        showStatus('Link copied!', 'success');
+                    }
+                } catch (e) {
+                    enqueueShake(el, true);
+                    showStatus('Failed to copy', 'error');
+                }
+            }
+        }, { passive: true });
+
+        el.addEventListener('keydown', function(e){
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                el.click();
+            }
+        });
+    }
+
+    function setup() {
+        var profileIdEl = document.getElementById('profileId');
+        var profileIdSmall = document.getElementById('profileIdSmall');
+        if (profileIdEl) {
+            setupCopyForElement(profileIdEl);
+            var mo = new MutationObserver(function(){
+                var txt = getTextFromElement(profileIdEl);
+                if (txt && !/loading/i.test(txt)) profileIdEl.dataset.copy = txt;
+            });
+            mo.observe(profileIdEl, { childList:true, characterData:true, subtree:true });
+        }
+        if (profileIdSmall) {
+            setupCopyForElement(profileIdSmall);
+            var mo2 = new MutationObserver(function(){
+                var txt = getTextFromElement(profileIdSmall);
+                if (txt && !/loading/i.test(txt)) profileIdSmall.dataset.copy = txt;
+            });
+            mo2.observe(profileIdSmall, { childList:true, characterData:true, subtree:true });
+        }
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', setup);
+    } else {
+        setup();
+    }
+})();
+</script>
+</body>
+</html>
